@@ -1,0 +1,577 @@
+"""One thread owns the database; the interface owns the keyboard.
+
+Reading this client's database is not cheap and cannot be made cheap: a poll
+that finds the file moved decrypts it, which measured 0.62 s and 0.94 s on two
+live rooms, and the interface used to do that between two keystrokes. Nothing
+about the read got faster here. It simply stopped happening on the thread that
+has to answer the keyboard.
+
+Three rules make that safe, and they are the whole design:
+
+* **One owner.** The :class:`Reader`, the :class:`Watcher` and every SQLite
+  connection behind them are touched by exactly one thread. The interface
+  holds no handle it could query — it hands over a :class:`Job` and is given a
+  :class:`Done` back. Cross-thread use of a connection is therefore not
+  guarded against, it is unrepresentable.
+* **Answers are applied where they are drawn.** A finished job waits in a
+  queue until the drawing thread drains it, so every mutation of what is on
+  screen still happens on one thread and in the order the loop chose.
+* **The queue is bounded and coalesced.** A conversation that polls faster
+  than the database answers must not build a backlog of stale polls, so a job
+  already in flight refuses its own duplicate rather than queueing behind it.
+  A job counts as in flight until its answer has been *applied*, not until it
+  has been computed: that is what bounds the answers waiting to be drained by
+  the same number the queue itself is bounded by, and what makes the release
+  of a question happen before the answer to it is handed over — so a settler
+  that reacts by asking again is never refused.
+
+:class:`DatabaseOwner` runs the same work on whatever thread submits it. That
+is not a second implementation of anything — it is the same jobs and the same
+answers, delivered immediately — and it is what lets the interface be driven
+synchronously by a test while production runs it over a thread.
+"""
+
+from __future__ import annotations
+
+import queue
+import sqlite3
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Sequence
+
+from ..errors import KamadoError
+from ..model import Message
+from ..reader import Reader
+from ..watch import Watcher
+
+ROOMS = "rooms"
+OPEN = "open"
+POLL = "poll"
+OLDER = "older"
+FRIENDS = "friends"
+FEEDS = "feeds"
+NAMES = "names"
+UNWATCH = "unwatch"
+RELEASE = "release"
+NOTICE = "notice"
+ATTACHMENTS = "attachments"
+REVISIONS = "revisions"
+REVEAL = "reveal"
+
+QUEUE_LIMIT = 16
+"""How many jobs may wait at once, and so how many answers can be waiting.
+
+Every job the interface asks for is either a duplicate of one in flight — and
+refused as one — or a distinct question about a tab, of which there are as
+many as the reader has opened. A queue deeper than this means the
+database has stopped answering, and stacking more work on it then is how a
+backlog turns into a screen showing answers to questions nobody still has.
+"""
+
+CLOSE_TIMEOUT_SECONDS = 5.0
+"""How long quitting waits for a read already in flight.
+
+A read cannot be cancelled: it is inside SQLite or inside a decryption. Quit
+therefore stops feeding the owner, waits this long for it to notice, and then
+leaves it to the process exit rather than holding the terminal hostage.
+"""
+
+WATCH_INTERVAL_SECONDS = 0.15
+"""The interval the watcher is built with; this loop drives its polls itself."""
+
+
+@dataclass(frozen=True)
+class Job:
+    """One question for the database, and who is waiting for the answer."""
+
+    kind: str
+    room_id: Optional[int] = None
+    token: int = 0
+    """Which tab asked, so an answer to a closed tab can be dropped."""
+    about: str = ""
+    """What else tells two jobs apart, when the room and the tab do not.
+
+    ``/real 가`` and ``/real 나`` are two questions about one room from one
+    tab, and the second must not be mistaken for a repeat of the first.
+    """
+    payload: tuple = ()
+
+    @property
+    def key(self) -> tuple:
+        """What makes two jobs the same question, for coalescing.
+
+        The tab is part of the question. A tab that was closed and reopened
+        is a different one asking, and its answer would be dropped for having
+        the wrong token — so without this, a reopened room could be refused a
+        read on the strength of the read its predecessor asked for.
+        """
+        return (self.kind, self.room_id, self.token, self.about)
+
+
+@dataclass(frozen=True)
+class Changed:
+    """What became of messages a tab already holds, once the database moved.
+
+    Deleted for everyone, a message keeps its id and has its text replaced,
+    and a watcher asks only for ids above the newest it has seen - so without
+    this the words stayed on screen until the room was opened again.
+    """
+
+    removed: frozenset
+    """Held ids no longer returned at all."""
+    rebuilt: tuple
+    """Held messages read again because their row changed, or was not known."""
+    versions: tuple
+    """``(id, version)`` for each rebuilt message, from the row it was built from."""
+    added: tuple = ()
+    """Rows written inside the held range after the tab read it.
+
+    The server can write a row under a lower logId than rows already written:
+    an offline receive is backfilled under an id the client had already
+    passed, measured as ten such inversions in one live room. The watcher
+    only asks for ids above the newest it saw, so these rows never arrive as
+    arrivals; they join the transcript here instead of being invisible until
+    the room reopens.
+    """
+
+
+class Polled(list):
+    """What one poll found: the arrivals, as a list, and what changed in place.
+
+    A list so every caller that only wanted the arrivals still gets exactly
+    that; *changed* is keyed by room and names only rooms that did change.
+    """
+
+    def __init__(self, arrived: Sequence[Message] = ()) -> None:
+        super().__init__(arrived)
+        self.changed: dict[int, Changed] = {}
+
+
+_ROW_FAILURES = (KamadoError, OSError, sqlite3.Error)
+
+def _changes(reader: Reader, room_id: int, held: dict) -> Optional[Changed]:
+    """Compare the rows a tab holds with what the database holds now.
+
+    One range read of versions, and only a row whose version differs - or
+    was never known - is read again. The version and the message built from
+    it come from the same read, so a change landing in between is caught by
+    the next poll rather than filed as seen.
+
+    The same read also names rows the tab does not hold. The window, the
+    arrivals and every older page are contiguous reads under this predicate,
+    so an id inside the held range that the tab lacks was written after it
+    was read - a backfill under an id the watcher's cursor already passed,
+    which only this comparison can see. Under the oldest held id nothing
+    tells such a row from history not yet loaded, so it is left to the
+    older-page read, which asks below that id and finds it there.
+    """
+    if not held:
+        return None
+    current = reader.row_versions(room_id, min(held), max(held), include_erased=True)
+    removed = {one for one in held if one not in current}
+    stale = [one for one, version in held.items() if one in current and version != current[one]]
+    unseen = sorted(one for one in current if one not in held)
+    rebuilt, versions = reader.messages_at(room_id, stale + unseen, include_erased=True)
+    found = {message.id for message in rebuilt}
+    # Gone between the two reads: as removed as a row the first read missed.
+    removed |= set(stale) - found
+    added = [message for message in rebuilt if message.id not in held]
+    rebuilt = [message for message in rebuilt if message.id in held]
+    if not removed and not rebuilt and not added:
+        return None
+    return Changed(frozenset(removed), tuple(rebuilt), tuple(versions.items()), tuple(added))
+
+
+@dataclass
+class Done:
+    """What one job produced, or why it produced nothing."""
+
+    job: Job
+    value: Any = None
+    error: Optional[BaseException] = None
+
+
+def _ignore(_done: Done) -> None:
+    """Where answers go before anyone has asked to be told about them."""
+
+
+class DatabaseOwner:
+    """Owns the reader and the watcher, and runs every job against them.
+
+    This base class runs a job on the thread that submits it, which is what a
+    test drives and what keeps a synchronous caller synchronous.
+    :class:`DatabaseWorker` runs the same jobs on a thread of its own.
+    """
+
+    def __init__(
+        self,
+        reader: Optional[Reader] = None,
+        *,
+        open_reader: Optional[Callable[[], Reader]] = None,
+        interval: float = WATCH_INTERVAL_SECONDS,
+    ) -> None:
+        if reader is None and open_reader is None:
+            raise ValueError("a reader, or a way of opening one, is required")
+        self._reader = reader
+        self._open_reader = open_reader
+        self._interval = interval
+        self.watcher: Optional[Watcher] = None
+        """Built on the first tab, on the owning thread, and never shared."""
+        self.sink: Callable[[Done], None] = _ignore
+        """Where a finished job is delivered, on the thread that drains it."""
+        self.closed = False
+        self.close_error: Optional[BaseException] = None
+        """What closing the reader raised, for a caller that wants to know."""
+
+    # -- the interface's side ------------------------------------------------
+
+    def submit(self, job: Job) -> bool:
+        """Ask for one piece of work. Returns whether it was taken on."""
+        self._deliver(self._run(job))
+        return True
+
+    def drain(self, timeout: Optional[float] = None) -> int:
+        """Deliver every finished job. Nothing waits here: none are pending."""
+        if timeout is not None:
+            raise TimeoutError("this owner finishes its work before it returns")
+        return 0
+
+    def close(self, timeout: float = CLOSE_TIMEOUT_SECONDS) -> bool:
+        """Close the database down. Returns whether the owner finished."""
+        self._shutdown()
+        return True
+
+    def __enter__(self) -> "DatabaseOwner":
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        self.close()
+
+    # -- the owner's side ----------------------------------------------------
+
+    def _deliver(self, done: Done) -> None:
+        self.sink(done)
+
+    def _run(self, job: Job) -> Done:
+        """Do one job, turning any failure into an answer rather than a crash.
+
+        A room can lose its key, be closed in the client, or have its database
+        rewritten underneath a read; none of that is a reason for the owner to
+        die, and none of it is a reason for the interface not to hear about
+        it. The failure is carried back to the thread that can say so.
+        """
+        try:
+            return Done(job, self._perform(job))
+        except Exception as error:  # noqa: BLE001 - reported, never swallowed
+            return Done(job, None, error)
+
+    def _reader_here(self) -> Reader:
+        """Resolve the reader on the owning thread, once.
+
+        Opening it here rather than handing one in is what keeps a SQLite
+        connection on the thread that made it.
+        """
+        if self._reader is None:
+            assert self._open_reader is not None
+            self._reader = self._open_reader()
+        return self._reader
+
+    def _perform(self, job: Job) -> Any:
+        reader = self._reader_here()
+        if job.kind == ROOMS:
+            return reader.rooms()
+        if job.kind == OPEN:
+            return self._open(reader, job)
+        if job.kind == POLL:
+            return self._poll(reader, job)
+        if job.kind == OLDER:
+            before_id, limit = job.payload
+            assert job.room_id is not None
+            return reader.messages(
+                job.room_id, limit=limit, before_id=before_id, include_erased=True
+            )
+        if job.kind == FRIENDS:
+            return reader.friends()
+        if job.kind == FEEDS:
+            (wanted,) = job.payload
+            assert job.room_id is not None
+            return reader.feed_details(job.room_id, list(wanted))
+        if job.kind == NAMES:
+            return self._names(reader, job)
+        if job.kind == NOTICE:
+            assert job.room_id is not None
+            return reader.notice(job.room_id)
+        if job.kind == ATTACHMENTS:
+            kind, limit = job.payload
+            assert job.room_id is not None
+            return reader.attachments(job.room_id, kind=kind, limit=limit)
+        if job.kind == REVISIONS:
+            (wanted,) = job.payload
+            assert job.room_id is not None
+            return self._revisions(reader, job.room_id, wanted)
+        if job.kind == REVEAL:
+            return self._reveal(reader, job)
+        if job.kind == UNWATCH:
+            if self.watcher is not None and job.room_id is not None:
+                self.watcher.unwatch(job.room_id)
+            return None
+        if job.kind == RELEASE:
+            self.watcher = None
+            return None
+        raise ValueError(f"unknown database job {job.kind!r}")
+
+    def _open(self, reader: Reader, job: Job) -> tuple:
+        """Start following a room, then read the window — in that order.
+
+        Two reads cannot be made one, so the only choice is which way they
+        overlap. Following first puts the watcher's cursor at a message the
+        window is then certain to contain or to be newer than, so a message
+        written between the two is reported as an arrival *and* already on
+        screen — and the tab drops what it already has. Reading the window
+        first inverts that into a gap: the cursor lands past a message the
+        window never held, and nothing ever asks for it again.
+        """
+        room, limit = job.payload
+        self._follow(reader, room.id)
+        try:
+            messages = reader.messages(room.id, limit=limit, include_erased=True)
+            stored = reader.stored_title(room.id)
+        except BaseException:
+            # No tab will exist to read it, so it is not left followed.
+            if self.watcher is not None:
+                self.watcher.unwatch(room.id)
+            raise
+        try:
+            # Read beside the window rather than as a job of its own: a
+            # notice is one row, and a second job per opened room is a
+            # second slot in a queue that is bounded on purpose.
+            notice = reader.notice(room.id)
+        except _ROW_FAILURES:
+            notice = None
+        return messages, stored, notice
+
+    def _poll(self, reader: Reader, job: Job) -> Polled:
+        """Report arrivals, and what changed among the rows each tab holds.
+
+        *job.payload* is ``(room_id, ((log_id, version or None), ...))`` per
+        tab, copied when the poll was asked for. Only a room the watcher read
+        because the database moved is compared, so an idle poll still costs
+        one stat. A room whose comparison fails keeps its arrivals and is
+        compared again on the next move.
+        """
+        if self.watcher is None:
+            return Polled()
+        found = Polled(self.watcher.poll())
+        moved = set(self.watcher.moved)
+        for room_id, held in job.payload:
+            if room_id not in moved:
+                continue
+            try:
+                change = _changes(reader, room_id, dict(held))
+            except _ROW_FAILURES:
+                continue
+            if change is not None:
+                found.changed[room_id] = change
+        return found
+
+    def _follow(self, reader: Reader, room_id: int) -> None:
+        """Add a room to the one watcher, building it on the first tab."""
+        if self.watcher is None:
+            self.watcher = Watcher(
+                reader, room_ids=[room_id], interval=self._interval, include_erased=True
+            )
+            self.watcher.prime()
+        else:
+            self.watcher.watch(room_id)
+
+    def _names(self, reader: Reader, job: Job) -> tuple:
+        """Answer who has answered to a name, with each account's chain."""
+        from ..names import steps_with_current
+
+        who = job.about
+        assert job.room_id is not None
+        history = reader.name_history(job.room_id)
+        found = reader.users_named(job.room_id, who, history)
+        current = reader.names()
+        return found, {
+            user_id: list(
+                steps_with_current(user_id, history.get(user_id, ()), current.get(user_id))
+            )
+            for user_id in found
+        }
+
+    def _revisions(self, reader: Reader, room_id: int, wanted: Sequence[int]) -> dict:
+        """Each message's earlier versions; one that has since gone has none."""
+        found: dict[int, list] = {}
+        for log_id in wanted:
+            try:
+                found[log_id] = reader.revisions(room_id, log_id)
+            except KamadoError:
+                found[log_id] = []
+        return found
+
+    def _reveal(self, reader: Reader, job: Job) -> dict:
+        """Cover or uncover SafeBot's messages, and read every held one again.
+
+        The reader decides what text a covered message carries, and the
+        watcher reads through the same reader, so the switch is made here,
+        on the thread that owns both. A read that fails puts the switch back:
+        a screen told the change did not happen must not be followed by
+        arrivals that say it did.
+        """
+        reveal, held = job.payload
+        before = reader.reveal_covered
+        reader.reveal_covered = reveal
+        try:
+            return {
+                room_id: reader.messages_at(room_id, list(ids), include_erased=True)
+                for room_id, ids in held
+            }
+        except BaseException:
+            reader.reveal_covered = before
+            raise
+
+    def _shutdown(self) -> None:
+        """Give up the watcher and close the reader, on the owning thread."""
+        if self.closed:
+            return
+        self.watcher = None
+        try:
+            if self._reader is not None:
+                self._reader.close()
+        except Exception as error:  # noqa: BLE001 - kept, not swallowed
+            self.close_error = error
+        finally:
+            self.closed = True
+
+
+_STOP = Job("stop")
+"""What the owner thread is given instead of a job when it is time to stop."""
+
+
+class DatabaseWorker(DatabaseOwner):
+    """The same owner, on one thread of its own."""
+
+    def __init__(
+        self,
+        reader: Optional[Reader] = None,
+        *,
+        open_reader: Optional[Callable[[], Reader]] = None,
+        interval: float = WATCH_INTERVAL_SECONDS,
+    ) -> None:
+        super().__init__(reader, open_reader=open_reader, interval=interval)
+        self._pending: "queue.Queue[Job]" = queue.Queue(maxsize=QUEUE_LIMIT)
+        self._done: "queue.Queue[Done]" = queue.Queue()
+        self._busy: set = set()
+        self._guard = threading.Lock()
+        self._stopping = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "DatabaseWorker":
+        """Begin owning the database. Idempotent, so entering twice is safe."""
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._own, name="kamado-database", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def __enter__(self) -> "DatabaseWorker":
+        return self.start()
+
+    def submit(self, job: Job) -> bool:
+        """Queue one job, refusing a duplicate of one already in flight."""
+        if self._stopping.is_set():
+            return False
+        with self._guard:
+            if job.key in self._busy or len(self._busy) >= QUEUE_LIMIT:
+                return False
+            self._busy.add(job.key)
+        try:
+            self._pending.put_nowait(job)
+        except queue.Full:
+            with self._guard:
+                self._busy.discard(job.key)
+            return False
+        return True
+
+    def drain(self, timeout: Optional[float] = None) -> int:
+        """Deliver every finished job to the sink, on the caller's thread.
+
+        With a *timeout* this waits for the first answer and fails if none
+        arrives, which is how a caller says "there is work in flight and I
+        cannot continue without it" without ever guessing at a duration.
+        """
+        delivered = 0
+        if timeout is not None:
+            try:
+                done = self._done.get(timeout=timeout)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"the database owner returned nothing within {timeout}s"
+                ) from None
+            self._hand_over(done)
+            delivered += 1
+        while True:
+            try:
+                done = self._done.get_nowait()
+            except queue.Empty:
+                return delivered
+            self._hand_over(done)
+            delivered += 1
+
+    def _hand_over(self, done: Done) -> None:
+        """Free the question, then answer it.
+
+        In that order: a settler routinely reacts by asking the same thing
+        again — a poll that failed is retried, a tab that took its history
+        asks for more — and a question still marked as in flight while its own
+        answer is being applied would refuse exactly that.
+        """
+        with self._guard:
+            self._busy.discard(done.job.key)
+        self.sink(done)
+
+    def close(self, timeout: float = CLOSE_TIMEOUT_SECONDS) -> bool:
+        """Stop feeding the owner and wait *timeout* for it to finish.
+
+        Returns whether it did. A read already inside SQLite cannot be taken
+        back, so a False here means the thread is still in one — it is a
+        daemon and the process exit collects it, and the caller is told rather
+        than blocked.
+        """
+        thread = self._thread
+        if thread is None:
+            self._shutdown()
+            return True
+        if not self._stopping.is_set():
+            self._stopping.set()
+            # Emptied first so the stop always fits, however full the queue is.
+            while True:
+                try:
+                    self._pending.get_nowait()
+                except queue.Empty:
+                    break
+            self._pending.put(_STOP)
+        thread.join(timeout)
+        if thread.is_alive():
+            return False
+        self._thread = None
+        return True
+
+    def _deliver(self, done: Done) -> None:
+        self._done.put(done)
+
+    def _own(self) -> None:
+        """Take jobs one at a time, for as long as there are any to take."""
+        try:
+            while True:
+                job = self._pending.get()
+                if job is _STOP:
+                    return
+                # The key is held until the answer is drained, not until it is
+                # computed: that is what stops a backlog of undrained answers
+                # from growing past what the queue itself allows.
+                self._deliver(self._run(job))
+        finally:
+            self._shutdown()

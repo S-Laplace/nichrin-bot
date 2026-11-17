@@ -1,0 +1,6 @@
+# API 키는 소스에 저장하지 않고 GEMINI_API_KEY 환경 변수로 관리합니다.
+__pycache__/
+*.pyc
+data/
+.pytest_cache/
+

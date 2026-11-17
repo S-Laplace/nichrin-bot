@@ -1,0 +1,756 @@
+"""Opening a room by posting a double-click, and refusing to send if it missed.
+
+The room list is owner-drawn: its rows are not windows and not UIA elements,
+so a row can only be addressed by coordinate. That makes a miss ordinary
+rather than exceptional, which is why every test here is about what happens
+when the wrong room opens.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+from pathlib import Path
+
+from kanao.errors import ErrorCode, KanaoError
+from kanao.winauto import ChatWindow, RoomOpener, Sender, row_geometry, live_row_geometry
+
+LIST_CONTROL = 900
+CONTACT_CONTROL = 901
+
+
+class FakeDesktop:
+    """A room list where each row opens the room the test put there."""
+
+    def __init__(self, rows: list[str], already_open: list[str] | None = None) -> None:
+        self.rows = rows
+        self.windows = [
+            ChatWindow(handle=100 + index, title=title)
+            for index, title in enumerate(already_open or [])
+        ]
+        self.clicks: list[int] = []
+        self.log: list[object] = []
+        self.closed: list[str] = []
+        self.list_control: int | None = LIST_CONTROL
+        self.restored = 0
+        self.restorable = True
+        self.waits = 0
+        self.main = "visible"
+        self.minimized: list[int] = []
+        self.draft = ""
+        self.actions: list[str] = []
+        self.searchable = False
+        self.listings: dict[str, list[str]] | None = None
+        self.searches: list[str] = []
+        self.cleared = 0
+        self._all_rows: list[str] | None = None
+        self.contacts: list[str] | None = None
+
+    # -- opening --------------------------------------------------------
+    def room_list(self) -> int | None:
+        return self.list_control
+
+    def contact_list(self) -> int | None:
+        return CONTACT_CONTROL if self.contacts is not None else None
+
+    def main_state(self) -> str:
+        return self.main
+
+    def show_main_window(self) -> bool:
+        self.restored += 1
+        self.main = "visible" if self.restorable else "hidden"
+        self.list_control = LIST_CONTROL if self.restorable else None
+        return self.list_control is not None
+
+    def restore_main_window(self, state: str) -> None:
+        self.main = state
+        self.log.append(f"main:{state}")
+
+    def minimize_window(self, handle: int) -> None:
+        self.minimized.append(handle)
+
+    def scroll_to_top(self, control: int) -> None:
+        assert control in (LIST_CONTROL, CONTACT_CONTROL)
+        self.log.append("top" if control == LIST_CONTROL else "contacts:top")
+
+    def click_row(self, control: int, row: int) -> None:
+        if control == CONTACT_CONTROL:
+            # Each friend row opens a chat with that row's title, as the
+            # account's own row opens the self-chat.
+            assert self.contacts is not None
+            self.log.append(f"contacts:{row}")
+            if row < len(self.contacts):
+                self.windows.append(ChatWindow(handle=300 + row, title=self.contacts[row]))
+            return
+        assert control == LIST_CONTROL
+        self.clicks.append(row)
+        self.log.append(row)
+        if row < len(self.rows):
+            title = self.rows[row]
+            if title not in [window.title for window in self.windows]:
+                self.windows.append(ChatWindow(handle=200 + row, title=title))
+
+    def search_rooms(self, text: str) -> int | None:
+        if not self.searchable:
+            return None
+        self.searches.append(text)
+        self.log.append(f"search:{text}")
+        if self._all_rows is None:
+            self._all_rows = self.rows
+        if self.listings is not None:
+            self.rows = list(self.listings.get(text, []))
+        else:
+            self.rows = [title for title in self._all_rows if text in title]
+        return LIST_CONTROL
+
+    def clear_search(self) -> None:
+        self.cleared += 1
+        if self._all_rows is not None:
+            self.rows, self._all_rows = self._all_rows, None
+
+    def close_window(self, handle: int) -> None:
+        for window in list(self.windows):
+            if window.handle == handle:
+                self.closed.append(window.title)
+                self.windows.remove(window)
+
+    # -- sending --------------------------------------------------------
+    def chat_windows(self) -> list[ChatWindow]:
+        return list(self.windows)
+
+    def input_handle(self, window: int) -> int | None:
+        return window + 1
+
+    def get_text(self, control: int) -> str:
+        return self.draft
+
+    def set_text(self, control: int, text: str) -> None:
+        self.actions.append("fill")
+        self.draft = text
+
+    def submit(self, control: int) -> None:
+        self.actions.append("submit")
+        # As the real client does: taking the message empties the box, which
+        # is what the send then reads back to confirm it went.
+        self.draft = ""
+
+
+def opener(desktop: FakeDesktop, rows: int = 6, remembered: Path | None = None) -> RoomOpener:
+    """Build an opener that waits on nothing and remembers nowhere shared.
+
+    The remembered rows live under %LOCALAPPDATA% in production, which two
+    tests would otherwise hand to each other.
+    """
+    if remembered is None:
+        remembered = Path(tempfile.mkdtemp()) / "rows.json"
+    desktop.waits = 0
+
+    def settle() -> None:
+        desktop.waits += 1
+
+    return RoomOpener(desktop, settle=settle, rows=rows, remembered=remembered)
+
+
+class OpeningTests(unittest.TestCase):
+    def test_the_row_holding_the_room_opens_it(self) -> None:
+        desktop = FakeDesktop(["첫 번째", "두 번째", "세 번째"])
+        window = opener(desktop).open("세 번째")
+        self.assertEqual(window.title, "세 번째")
+
+    def test_a_room_that_opened_by_mistake_is_closed_again(self) -> None:
+        desktop = FakeDesktop(["남의 방", "찾는 방"])
+        opener(desktop).open("찾는 방")
+        self.assertEqual(desktop.closed, ["남의 방"], "a stray window was left open")
+
+    def test_the_target_is_never_closed(self) -> None:
+        desktop = FakeDesktop(["남의 방", "찾는 방"])
+        opener(desktop).open("찾는 방")
+        self.assertNotIn("찾는 방", desktop.closed)
+
+    def test_a_room_that_is_not_in_the_list_is_refused(self) -> None:
+        desktop = FakeDesktop(["하나", "둘"])
+        with self.assertRaises(KanaoError) as caught:
+            opener(desktop).open("없는 방")
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+
+    def test_every_room_opened_while_searching_is_closed_again(self) -> None:
+        desktop = FakeDesktop(["하나", "둘"])
+        with self.assertRaises(KanaoError):
+            opener(desktop).open("없는 방")
+        self.assertEqual(sorted(desktop.closed), ["둘", "하나"])
+
+    def test_the_search_stops_at_the_row_budget(self) -> None:
+        desktop = FakeDesktop(["a", "b", "c", "d"])
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=2).open("d")
+        self.assertEqual(desktop.clicks, [0, 1])
+
+
+class SendWithOpeningTests(unittest.TestCase):
+    def sender(self, desktop: FakeDesktop) -> Sender:
+        return Sender(desktop, running=lambda: True, opener=opener(desktop))
+
+    def test_a_closed_room_is_opened_and_then_written_to(self) -> None:
+        desktop = FakeDesktop(["남의 방", "받는 방"])
+        result = self.sender(desktop).send("받는 방", "안녕", open_if_needed=True)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(desktop.actions, ["fill", "submit"])
+        self.assertEqual(desktop.closed, ["남의 방"])
+
+    def test_without_the_flag_a_closed_room_is_still_refused(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        with self.assertRaises(KanaoError) as caught:
+            self.sender(desktop).send("받는 방", "안녕")
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+        self.assertEqual(desktop.clicks, [], "a send without --open touched the room list")
+
+    def test_an_open_room_is_never_clicked_for(self) -> None:
+        desktop = FakeDesktop(["받는 방"], already_open=["받는 방"])
+        self.sender(desktop).send("받는 방", "안녕", open_if_needed=True)
+        self.assertEqual(desktop.clicks, [])
+
+    def test_a_dry_run_may_open_but_never_writes(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        result = self.sender(desktop).send("받는 방", "안녕", dry_run=True, open_if_needed=True)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(desktop.actions, [])
+
+
+class AliasTests(unittest.TestCase):
+    """A window carries the client's title, which is not always the catalog's."""
+
+    def test_a_room_known_by_another_title_still_opens(self) -> None:
+        desktop = FakeDesktop(["나상권"])
+        window = opener(desktop).open("나와의 채팅", aliases=["나상권"])
+        self.assertEqual(window.title, "나상권")
+
+    def test_an_alias_is_matched_for_an_already_open_window(self) -> None:
+        desktop = FakeDesktop(["나상권"], already_open=["나상권"])
+        sender = Sender(desktop, running=lambda: True, opener=opener(desktop))
+        result = sender.send("나와의 채팅", "안녕", aliases=["나상권"])
+        self.assertEqual(result["room"], "나상권")
+        self.assertEqual(desktop.clicks, [])
+
+    def test_an_alias_does_not_widen_an_ordinary_match(self) -> None:
+        desktop = FakeDesktop(["다른 방"])
+        with self.assertRaises(KanaoError):
+            opener(desktop).open("받는 방", aliases=["또 다른 방"])
+
+
+class MainWindowTests(unittest.TestCase):
+    """The room list lives in the main window, which may be in the tray."""
+
+    def test_friends_tab_switches_to_chat_tab_before_search(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.searchable = True
+        tab = {"shown": False}
+
+        def show_chat_tab() -> bool:
+            tab["shown"] = True
+            return True
+
+        original = desktop.search_rooms
+
+        def search_rooms(name: str) -> int | None:
+            self.assertTrue(tab["shown"], "searched while the chat tab was hidden")
+            return original(name)
+
+        desktop.show_chat_tab = show_chat_tab  # type: ignore[attr-defined]
+        desktop.search_rooms = search_rooms  # type: ignore[method-assign]
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(window.title, "받는 방")
+        self.assertTrue(tab["shown"])
+
+    def test_refuse_when_chat_tab_cannot_be_shown(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.show_chat_tab = lambda: False  # type: ignore[attr-defined]
+        with self.assertRaises(KanaoError) as caught:
+            opener(desktop).open("받는 방")
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+        self.assertEqual(desktop.clicks, [], "opened a room while list was hidden")
+
+    def test_a_hidden_main_window_is_restored_before_giving_up(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.list_control = None
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(window.title, "받는 방")
+        self.assertEqual(desktop.restored, 1)
+
+    def test_a_main_window_that_cannot_be_restored_is_a_typed_failure(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.list_control = None
+        desktop.restorable = False
+        with self.assertRaises(KanaoError) as caught:
+            opener(desktop).open("받는 방")
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+
+    def test_a_visible_main_window_is_left_alone(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        opener(desktop).open("받는 방")
+        self.assertEqual(desktop.restored, 0, "the main window was disturbed for nothing")
+
+
+class StoredTitleTests(unittest.TestCase):
+    """The alias the CLI passes comes from the catalog's own title column."""
+
+    def test_the_self_chat_keeps_the_name_its_window_carries(self) -> None:
+        from tests.fixtures import SELF_ROOM, SELF_STORED_TITLE, build_reader
+
+        with build_reader() as reader:
+            room = reader.room(SELF_ROOM)
+            assert room is not None
+            self.assertEqual(room.title, "나와의 채팅")
+            self.assertEqual(reader.stored_title(SELF_ROOM), SELF_STORED_TITLE)
+
+    def test_a_room_without_a_stored_title_has_no_alias(self) -> None:
+        from tests.fixtures import GROUP_ROOM, build_reader
+
+        with build_reader() as reader:
+            self.assertIsNone(reader.stored_title(GROUP_ROOM))
+
+
+class SelfChatSearchTests(unittest.TestCase):
+    """The self-chat is searched under the account's name, which other rooms match too (#87).
+
+    The catalog counts the account as a member of every room it is in, so
+    that name is predicted to list newer rooms above the self-chat. Opening
+    the first result opened somebody else's room, marked it read, closed it,
+    and the send failed. This is what remains when the friends list cannot
+    open it (:class:`OwnProfileTests`).
+    """
+
+    def test_the_self_chat_opens_at_the_row_predicted_for_the_account_name(self) -> None:
+        from kanao.opening import window_target
+        from tests.fixtures import OWN_ID, SELF_ROOM, SELF_STORED_TITLE, build_reader
+
+        with build_reader() as reader:
+            reader._names = {**reader.names(), OWN_ID: SELF_STORED_TITLE}
+            rooms = reader.rooms()
+            room = reader.room(SELF_ROOM)
+            assert room is not None
+            newer = [r.title for r in rooms[: [r.id for r in rooms].index(SELF_ROOM)]]
+            self.assertTrue(newer, "the fixture's self-chat must not be the newest room")
+            desktop = FakeDesktop([*newer, SELF_STORED_TITLE])
+            desktop.searchable = True
+            desktop.listings = {SELF_STORED_TITLE: [*newer, SELF_STORED_TITLE]}
+            aliases, hint, rows = window_target(reader, room)
+            window = opener(desktop, rows=2).open(room.title, aliases, hint, rows)
+        self.assertEqual(window.title, SELF_STORED_TITLE)
+        self.assertEqual(desktop.closed, [], "another room was opened and marked read")
+        self.assertEqual(desktop.clicks, [len(newer)])
+        # 나와의 채팅 is never typed: the client lists nothing under it.
+        self.assertEqual(desktop.searches, [SELF_STORED_TITLE])
+
+    def test_without_predictions_every_name_is_tried_at_the_top(self) -> None:
+        # A caller with no catalog keeps the old behaviour rather than none.
+        desktop = FakeDesktop(["하나", "합성 이름"])
+        desktop.searchable = True
+        window = opener(desktop, rows=2).open("나와의 채팅", aliases=["합성 이름"], hint=9)
+        self.assertEqual(window.title, "합성 이름")
+        self.assertEqual(desktop.searches, ["나와의 채팅", "합성 이름"])
+
+    def test_a_name_predicted_to_list_nothing_is_not_searched(self) -> None:
+        desktop = FakeDesktop(["하나", "합성 이름"])
+        desktop.searchable = True
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=2).open(
+                "나와의 채팅",
+                aliases=["합성 이름"],
+                hint=9,
+                search_rows={"나와의 채팅": None, "합성 이름": None},
+            )
+        self.assertEqual(desktop.searches, [])
+        self.assertEqual(desktop.closed, [], "a row was opened for a name nothing lists")
+
+
+class OwnProfileTests(unittest.TestCase):
+    """The self-chat opens from the account's own row atop the friends list (#87).
+
+    Double-clicking that row opens the self-chat whatever the chat list's
+    order or the name it is listed under, so no search is typed and no row
+    of anybody else's is guessed at.
+    """
+
+    def desktop(self, contacts: list[str] | None) -> FakeDesktop:
+        # A search that would list a stranger first, as it did in #87.
+        desktop = FakeDesktop(["남의 방", "합성 이름"])
+        desktop.searchable = True
+        desktop.listings = {"합성 이름": ["남의 방", "합성 이름"]}
+        desktop.contacts = contacts
+        return desktop
+
+    def test_the_self_chat_opens_from_the_account_row(self) -> None:
+        desktop = self.desktop(["합성 이름", "친구"])
+        window = opener(desktop).open(
+            "나와의 채팅", aliases=["합성 이름"], hint=9, self_chat=True
+        )
+        self.assertEqual(window.title, "합성 이름")
+        self.assertEqual(desktop.log, ["contacts:top", "contacts:0"])
+        self.assertEqual(desktop.searches, [], "the search ran although the profile opened it")
+        self.assertEqual(desktop.closed, [])
+        self.assertEqual(desktop.minimized, [window.handle])
+
+    def test_a_send_to_the_self_chat_goes_through_the_friends_list(self) -> None:
+        desktop = self.desktop(["합성 이름"])
+        sender = Sender(desktop, running=lambda: True, opener=opener(desktop))
+        result = sender.send(
+            "나와의 채팅", "안녕", open_if_needed=True, aliases=["합성 이름"], self_chat=True
+        )
+        self.assertTrue(result["submitted"])
+        self.assertEqual(desktop.log, ["contacts:top", "contacts:0"])
+
+    def test_any_other_room_never_touches_the_friends_list(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.searchable = True
+        desktop.contacts = ["합성 이름"]
+        window = opener(desktop).open("받는 방", hint=9)
+        self.assertEqual(window.title, "받는 방")
+        self.assertNotIn("contacts:0", desktop.log)
+
+    def test_a_wrong_window_from_the_friends_list_is_closed_and_searched_past(self) -> None:
+        desktop = self.desktop(["친구"])
+        window = opener(desktop).open(
+            "나와의 채팅",
+            aliases=["합성 이름"],
+            hint=9,
+            search_rows={"나와의 채팅": None, "합성 이름": 1},
+            self_chat=True,
+        )
+        self.assertEqual(window.title, "합성 이름")
+        self.assertEqual(desktop.closed, ["친구"])
+        self.assertEqual(desktop.searches, ["합성 이름"])
+
+    def test_without_a_friends_list_the_self_chat_is_searched_for(self) -> None:
+        desktop = self.desktop(None)
+        window = opener(desktop).open(
+            "나와의 채팅",
+            aliases=["합성 이름"],
+            hint=9,
+            search_rows={"나와의 채팅": None, "합성 이름": 1},
+            self_chat=True,
+        )
+        self.assertEqual(window.title, "합성 이름")
+        self.assertEqual(desktop.searches, ["합성 이름"])
+        self.assertEqual(desktop.closed, [])
+
+
+class ScrollTests(unittest.TestCase):
+    """A row number only means something when the list is at the top.
+
+    Opening rooms moves the list, so a scan that did not reset it addressed
+    different rooms as it went: a room found at row 0 one minute was missed
+    across all eight rows the next.
+    """
+
+    def test_the_list_is_pinned_to_the_top_before_every_row(self) -> None:
+        desktop = FakeDesktop(["남의 방", "찾는 방"])
+        opener(desktop).open("찾는 방")
+        self.assertEqual(desktop.log, ["top", 0, "top", 1])
+
+    def test_an_open_room_needs_no_scrolling(self) -> None:
+        desktop = FakeDesktop(["받는 방"], already_open=["받는 방"])
+        Sender(desktop, running=lambda: True, opener=opener(desktop)).send(
+            "받는 방", "안녕", open_if_needed=True
+        )
+        self.assertEqual(desktop.log, [])
+
+
+class TidinessTests(unittest.TestCase):
+    """What was opened is parked, and what was disturbed is put back."""
+
+    def test_a_room_this_opened_is_minimised(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(desktop.minimized, [window.handle])
+
+    def test_a_room_the_user_already_had_open_is_left_as_it_is(self) -> None:
+        desktop = FakeDesktop(["받는 방"], already_open=["받는 방"])
+        Sender(desktop, running=lambda: True, opener=opener(desktop)).send(
+            "받는 방", "안녕", open_if_needed=True
+        )
+        self.assertEqual(desktop.minimized, [], "a window the user arranged was moved")
+
+    def test_a_main_window_from_the_tray_goes_back_to_the_tray(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.main = "hidden"
+        desktop.list_control = None
+        opener(desktop).open("받는 방")
+        self.assertEqual(desktop.main, "hidden", "the tray icon was left as a window")
+
+    def test_a_main_window_that_was_already_up_is_not_touched(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        opener(desktop).open("받는 방")
+        self.assertNotIn("main:visible", desktop.log)
+
+
+class AimTests(unittest.TestCase):
+    """Every row tried opens a real room and marks it read, so aim first."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.remembered = Path(directory.name) / "rows.json"
+
+    def test_the_hinted_row_is_tried_before_anything_else(self) -> None:
+        desktop = FakeDesktop(["하나", "둘", "셋", "받는 방"])
+        opener(desktop).open("받는 방", hint=3)
+        self.assertEqual(desktop.clicks, [3], "rooms were opened on the way to a known row")
+
+    def test_with_a_search_box_no_row_is_guessed_at(self) -> None:
+        # A pinned room sits at the top however recent the catalog says it
+        # is; the search finds it without opening any other room first.
+        desktop = FakeDesktop(["받는 방", "둘", "셋", "넷"])
+        desktop.searchable = True
+        opener(desktop).open("받는 방", hint=3)
+        self.assertEqual(desktop.clicks, [0])
+        self.assertEqual(desktop.searches, ["받는 방"])
+        self.assertEqual(desktop.closed, [], "another room's window appeared")
+
+    def test_a_search_that_misses_is_not_followed_by_guessing(self) -> None:
+        desktop = FakeDesktop(["하나", "받는 방 2", "받는 방"])
+        desktop.searchable = True
+        with self.assertRaises(KanaoError):
+            opener(desktop).open("받는 방", hint=2)
+        self.assertEqual(desktop.clicks, [0], "rows were guessed after the search had run")
+
+    def test_a_hint_that_misses_without_a_search_box_opens_nothing_else(self) -> None:
+        desktop = FakeDesktop(["하나", "둘", "셋", "받는 방"])
+        with self.assertRaises(KanaoError):
+            opener(desktop).open("받는 방", hint=2)
+        self.assertEqual(desktop.clicks, [2])
+
+    def test_a_row_that_worked_is_remembered(self) -> None:
+        desktop = FakeDesktop(["하나", "받는 방"])
+        opener(desktop, remembered=self.remembered).open("받는 방")
+        self.assertTrue(self.remembered.exists())
+
+        again = FakeDesktop(["하나", "받는 방"])
+        opener(again, remembered=self.remembered).open("받는 방")
+        self.assertEqual(again.clicks, [1], "the remembered row was not used")
+
+    def test_a_remembered_row_that_moved_still_finds_the_room(self) -> None:
+        desktop = FakeDesktop(["하나", "받는 방"])
+        opener(desktop, remembered=self.remembered).open("받는 방")
+        moved = FakeDesktop(["받는 방", "하나"])
+        window = opener(moved, remembered=self.remembered).open("받는 방")
+        self.assertEqual(window.title, "받는 방")
+
+    def test_the_remembered_file_does_not_hold_room_names(self) -> None:
+        desktop = FakeDesktop(["하나", "받는 방"])
+        opener(desktop, remembered=self.remembered).open("받는 방")
+        raw = self.remembered.read_bytes()
+        self.assertNotIn("받는 방".encode(), raw)
+
+
+class FarRoomTests(unittest.TestCase):
+    """A room past the searched rows is not swept for; it is searched for.
+
+    Sweeping the top of the list for a room the catalog places lower down
+    opened every room up there, each marked read, and then failed anyway.
+    """
+
+    def test_a_far_hint_opens_no_row_without_a_search_box(self) -> None:
+        desktop = FakeDesktop(["하나", "둘", "셋"])
+        with self.assertRaises(KanaoError) as caught:
+            opener(desktop, rows=3).open("받는 방", hint=40)
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+        self.assertEqual(desktop.clicks, [], "rooms were opened for one out of reach")
+
+    def test_a_far_room_is_found_through_the_search_box(self) -> None:
+        desktop = FakeDesktop(["하나", "둘", "셋", "넷", "받는 방"])
+        desktop.searchable = True
+        window = opener(desktop, rows=3).open("받는 방", hint=4)
+        self.assertEqual(window.title, "받는 방")
+        self.assertEqual(desktop.searches, ["받는 방"])
+        self.assertEqual(desktop.clicks, [0], "more than the filtered row was opened")
+        self.assertEqual(desktop.closed, [])
+
+    def test_the_search_is_cleared_whatever_it_found(self) -> None:
+        desktop = FakeDesktop(["하나", "둘"])
+        desktop.searchable = True
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=2).open("없는 방", hint=9)
+        self.assertEqual(desktop.cleared, 1)
+
+    def test_the_self_chat_is_searched_under_its_window_title(self) -> None:
+        # The catalog calls it 나와의 채팅; the client lists it under the
+        # account's own name, which is what the search box matches (#82).
+        desktop = FakeDesktop(["하나", "둘", "합성 이름"])
+        desktop.searchable = True
+        window = opener(desktop, rows=2).open("나와의 채팅", aliases=["합성 이름"], hint=9)
+        self.assertEqual(window.title, "합성 이름")
+        self.assertEqual(desktop.searches, ["나와의 채팅", "합성 이름"])
+        self.assertEqual(desktop.closed, [])
+        self.assertEqual(desktop.cleared, 1)
+
+    def test_a_filtered_row_that_is_someone_else_is_closed(self) -> None:
+        # The search box matches substrings; the title must still be exact.
+        desktop = FakeDesktop(["하나", "둘", "받는 방 2", "받는 방"])
+        desktop.searchable = True
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=2).open("받는 방", hint=3)
+        self.assertEqual(desktop.closed, ["받는 방 2"])
+
+    def test_a_near_miss_falls_back_to_the_search(self) -> None:
+        desktop = FakeDesktop(["하나", "둘", "셋", "받는 방"])
+        desktop.searchable = True
+        window = opener(desktop, rows=2).open("받는 방", hint=1)
+        self.assertEqual(window.title, "받는 방")
+        self.assertEqual(desktop.log[-2:], ["search:받는 방", 0])
+
+    def test_a_remembered_row_is_still_tried_for_a_far_room(self) -> None:
+        remembered = Path(tempfile.mkdtemp()) / "rows.json"
+        desktop = FakeDesktop(["하나", "받는 방"])
+        opener(desktop, rows=3, remembered=remembered).open("받는 방")
+        again = FakeDesktop(["하나", "받는 방"])
+        opener(again, rows=3, remembered=remembered).open("받는 방", hint=50)
+        self.assertEqual(again.clicks, [1])
+
+
+class ParkingTests(unittest.TestCase):
+    """A room the client shows again after it was minimised is put back down."""
+
+    def test_a_window_that_rises_again_is_minimised_again(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        rises = [False, False]  # the client's own show undoes the first minimise
+        desktop.is_minimized = lambda handle: rises.pop(0) if rises else True  # type: ignore[attr-defined]
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(desktop.minimized, [window.handle] * 3)
+
+    def test_a_window_raised_after_parking_is_put_down_by_repark(self) -> None:
+        # A room the client never opened is shown late, after parking ended.
+        desktop = FakeDesktop(["받는 방"])
+        state = {"down": True}
+        desktop.is_minimized = lambda handle: state["down"]  # type: ignore[attr-defined]
+        sender = Sender(desktop, running=lambda: True, opener=opener(desktop))
+        window = sender.resolve("받는 방", open_if_needed=True)
+        state["down"] = False
+        sender.repark(window)
+        self.assertEqual(desktop.minimized, [window.handle, window.handle])
+
+    def test_repark_leaves_a_window_that_stayed_down(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.is_minimized = lambda handle: True  # type: ignore[attr-defined]
+        sender = Sender(desktop, running=lambda: True, opener=opener(desktop))
+        window = sender.resolve("받는 방", open_if_needed=True)
+        sender.repark(window)
+        self.assertEqual(desktop.minimized, [window.handle])
+
+    def test_a_window_that_stays_down_is_minimised_once(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        desktop.is_minimized = lambda handle: True  # type: ignore[attr-defined]
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(desktop.minimized, [window.handle])
+
+
+class FocusTests(unittest.TestCase):
+    """The keyboard goes back to whoever had it before a room was opened.
+
+    The client activates a room's window as it shows it, so opening one took
+    the keyboard from wherever the person was typing and left it with a
+    window that had just been minimised.
+    """
+
+    TYPING_HERE = 4242
+
+    def desktop(self, rows: list[str]) -> FakeDesktop:
+        desktop = FakeDesktop(rows)
+        desktop.focus = self.TYPING_HERE  # type: ignore[attr-defined]
+        desktop.returned = []  # type: ignore[attr-defined]
+        opened_by = desktop.click_row
+
+        def click_row(control: int, row: int) -> None:
+            before = {window.handle for window in desktop.windows}
+            opened_by(control, row)
+            for window in desktop.windows:
+                if window.handle not in before:
+                    desktop.focus = window.handle  # type: ignore[attr-defined]
+
+        def return_focus(handle: int) -> None:
+            desktop.returned.append(handle)  # type: ignore[attr-defined]
+            desktop.focus = handle  # type: ignore[attr-defined]
+
+        desktop.click_row = click_row  # type: ignore[method-assign]
+        desktop.foreground = lambda: desktop.focus  # type: ignore[attr-defined]
+        desktop.return_focus = return_focus  # type: ignore[attr-defined]
+        return desktop
+
+    def test_focus_returns_to_where_it_was(self) -> None:
+        desktop = self.desktop(["받는 방"])
+        opener(desktop).open("받는 방")
+        self.assertEqual(desktop.returned, [self.TYPING_HERE])  # type: ignore[attr-defined]
+
+    def test_focus_returns_after_a_room_that_was_not_found(self) -> None:
+        desktop = self.desktop(["남의 방"])
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=1).open("받는 방")
+        self.assertEqual(desktop.returned, [self.TYPING_HERE])  # type: ignore[attr-defined]
+
+    def test_focus_that_never_moved_is_left_alone(self) -> None:
+        desktop = self.desktop([])
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=1).open("받는 방")
+        self.assertEqual(desktop.returned, [])  # type: ignore[attr-defined]
+
+
+class FlashTests(unittest.TestCase):
+    """A room that opens is in front until it is minimised, so do not dawdle.
+
+    The wait used to be a flat 1.2 s per row whether or not the window was
+    already there, which is how long someone's conversation sat over whatever
+    they were doing.
+    """
+
+    def test_a_window_that_is_already_there_is_not_waited_for(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        opener(desktop).open("받는 방")
+        self.assertEqual(desktop.waits, 0, "waited for a window that had already opened")
+
+    def test_the_window_is_minimised_before_anything_else_happens(self) -> None:
+        desktop = FakeDesktop(["받는 방"])
+        window = opener(desktop).open("받는 방")
+        self.assertEqual(desktop.minimized, [window.handle])
+
+    def test_a_row_that_opens_nothing_gives_up(self) -> None:
+        desktop = FakeDesktop([])
+        with self.assertRaises(KanaoError):
+            opener(desktop, rows=2).open("없는 방")
+        self.assertLessEqual(desktop.waits, 2 * 40, "the give-up budget grew")
+
+
+class ScalingTests(unittest.TestCase):
+    """The row geometry was measured at 100%, and nobody else runs at 100%.
+
+    A laptop at 150% draws the list half again as tall, so a row number
+    computed from the measured pitch lands on the wrong room — and opening
+    the wrong room marks it read.
+    """
+
+    def test_logical_coordinate_override_for_verified_kakaotalk_client(self) -> None:
+        with patch.dict(os.environ, {"KANAO_ROOM_LIST_LOGICAL_COORDS": "1"}):
+            self.assertEqual(live_row_geometry(144), (68, 29, 134))
+        with patch.dict(os.environ, {"KANAO_ROOM_LIST_LOGICAL_COORDS": "0"}):
+            self.assertEqual(live_row_geometry(144), (102, 44, 201))
+
+    def test_a_hundred_percent_screen_keeps_the_measured_numbers(self) -> None:
+        pitch, first, column = row_geometry(96)
+        self.assertEqual((pitch, first, column), (68, 29, 134))
+
+    def test_a_scaled_screen_scales_the_rows(self) -> None:
+        pitch, first, column = row_geometry(144)
+        self.assertEqual(pitch, 102)
+        self.assertEqual(first, 44)
+        self.assertEqual(column, 201)
+
+    def test_a_quarter_step_is_rounded_rather_than_dropped(self) -> None:
+        pitch, _first, _column = row_geometry(120)
+        self.assertEqual(pitch, 85)
+
+    def test_an_unreadable_scale_falls_back_to_the_measured_one(self) -> None:
+        self.assertEqual(row_geometry(0), row_geometry(96))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,859 @@
+"""Reader tests: who the user is, what a room is called, and what it contains."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import unittest
+import unittest.mock
+
+from kamado.errors import ErrorCode, KamadoError
+from kamado.keyring import Keyring
+from kamado.reader import Reader
+
+from tests.fixtures import (
+    DIRECT_ROOM,
+    FRIEND_ID,
+    GROUP_ROOM,
+    HUGE_ID,
+    HUGE_ROOM,
+    OWN_ID,
+    PEER_ID,
+    CONTAINER,
+    DATABASE,
+    OPEN_ROOM,
+    SELF_ROOM,
+    STRANGER_ID,
+    NAMED_ROOM,
+    StubCache,
+    build_profile,
+    build_reader,
+)
+
+
+def room_of(reader, room_id):
+    """The fixture's room, said as a failure when the fixture has lost it.
+
+    `Reader.room` may answer None — a room really can be missing — and these
+    tests are about what a room is *called*, not about whether the fixture
+    still holds one.
+    """
+    found = reader.room(room_id)
+    assert found is not None, f"the fixture has no room {room_id}"
+    return found
+
+
+class IdentityTests(unittest.TestCase):
+    def test_the_signed_in_account_is_stated_by_the_context(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+
+    def test_the_context_wins_over_an_unrelated_account(self) -> None:
+        from dataclasses import replace
+
+        with build_reader() as reader:
+            reader._keyring = replace(reader.keyring, account=replace(reader.account, user_id=STRANGER_ID))
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+
+    def test_context_identifies_the_account_without_a_self_chat(self) -> None:
+        with build_reader(with_self_room=False) as reader:
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+
+    def test_resolving_the_account_is_only_done_once(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+            reader.connection().execute("DELETE FROM NTChatContext")
+            reader._keyring = Keyring(CONTAINER, [DATABASE], None)
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+
+    def test_missing_context_falls_back_to_the_derived_account(self) -> None:
+        with build_reader() as reader:
+            reader.connection().execute("DELETE FROM NTChatContext")
+            self.assertEqual(reader.own_user_id(), OWN_ID)
+
+
+class NameTests(unittest.TestCase):
+    def test_a_name_the_user_assigned_beats_the_contacts_own_nickname(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.names()[PEER_ID], "Peer Renamed")
+
+    def test_the_signed_in_account_is_named_from_ntuser(self) -> None:
+        """The macOS user table includes the owner as well as contacts."""
+        with build_reader() as reader:
+            self.assertEqual(reader.names()[OWN_ID], "My Own Name")
+
+    def test_a_contact_with_no_name_at_all_is_left_out_rather_than_invented(self) -> None:
+        with build_reader() as reader:
+            reader.connection().execute(
+                "UPDATE NTUser SET nickName = NULL, displayName = NULL, friendNickName = NULL WHERE userId = ?",
+                (STRANGER_ID,),
+            )
+            self.assertNotIn(STRANGER_ID, reader.names())
+
+
+class RoomTests(unittest.TestCase):
+    def test_rooms_are_listed_most_recently_active_first(self) -> None:
+        with build_reader() as reader:
+            order = [room.id for room in reader.rooms()]
+        self.assertEqual(order[0], DIRECT_ROOM)
+        self.assertEqual(order.index(DIRECT_ROOM) < order.index(GROUP_ROOM), True)
+
+    def test_one_decrypted_database_makes_every_room_readable(self) -> None:
+        with build_reader() as reader:
+            rooms = reader.rooms()
+        self.assertEqual(len(rooms), 6)
+        self.assertTrue(all(room.readable for room in rooms))
+
+    def test_a_direct_room_is_titled_with_the_other_person(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(room_of(reader, DIRECT_ROOM).title, "Peer Renamed")
+
+    def test_a_group_room_without_a_title_lists_its_other_members(self) -> None:
+        with build_reader() as reader:
+            title = room_of(reader, GROUP_ROOM).title
+        self.assertIn("Peer Renamed", title)
+        self.assertIn("Friend Nick", title)
+        self.assertNotIn("My Own Name", title)
+
+    def test_a_custom_group_title_is_used_as_stored(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(room_of(reader, NAMED_ROOM).title, "Named Group")
+
+    def test_a_room_renamed_in_the_client_takes_that_name(self) -> None:
+        """A rename never touches the room row; the name goes to the meta table.
+
+        Left to the room row, a two-person group comes out titled after the one
+        other person in it — the same name as the direct chat with that person,
+        which is a collision the send path then has to refuse, and a window
+        title the client never shows.
+        """
+        with build_reader(metas=[(GROUP_ROOM, 3, 10, "합성 스터디방")]) as reader:
+            named = reader.room(GROUP_ROOM)
+        assert named is not None
+        self.assertEqual(named.title, "합성 스터디방")
+
+    def test_the_newest_revision_of_a_name_is_the_one_shown(self) -> None:
+        metas = [(GROUP_ROOM, 3, 10, "옛 이름"), (GROUP_ROOM, 3, 20, "새 이름")]
+        with build_reader(metas=metas) as reader:
+            renamed = reader.room(GROUP_ROOM)
+        assert renamed is not None
+        self.assertEqual(renamed.title, "새 이름")
+
+    def test_a_notice_is_not_a_name(self) -> None:
+        """Type 1 is the room's notice, kept in the same table as its name."""
+        with build_reader(metas=[(GROUP_ROOM, 1, 10, "공지입니다")]) as reader:
+            noticed = reader.room(GROUP_ROOM)
+        assert noticed is not None
+        self.assertIn("Peer Renamed", noticed.title)
+
+    def test_the_stored_title_falls_back_to_the_name_the_window_carries(self) -> None:
+        with build_reader(metas=[(GROUP_ROOM, 3, 10, "합성 스터디방")]) as reader:
+            self.assertEqual(reader.stored_title(GROUP_ROOM), "합성 스터디방")
+
+    def test_a_feed_says_what_its_own_row_carries(self) -> None:
+        """An open chat's SafeBot writes the reason it covered something.
+
+        The type number is not confirmed against a live client, so it stays a
+        number; the cover is a string the client wrote, so it is quoted.
+        """
+        covering = json.dumps(
+            {
+                "feedType": 26,
+                "coverType": "openchat_blind",
+                "chatLogInfos": [{"logId": 7001, "type": 1}],
+            }
+        )
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, covering, None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(
+                reader.feed_details(DIRECT_ROOM, [7002]), {7002: "26 openchat_blind"}
+            )
+
+    def test_a_membership_feed_says_who_it_names(self) -> None:
+        joining = json.dumps(
+            {"feedType": 4, "members": [{"userId": PEER_ID, "nickName": "합성 닉"}]}
+        )
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, joining, None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(
+                reader.feed_details(DIRECT_ROOM, [7002]), {7002: "합성 닉님이 입장하셨습니다."}
+            )
+
+    def test_a_leave_is_said_in_words(self) -> None:
+        leaving = json.dumps({"feedType": 2, "member": {"nickName": "떠난 이름"}})
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, leaving, None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(
+                reader.feed_details(DIRECT_ROOM, [7002]), {7002: "떠난 이름님이 퇴장하셨습니다."}
+            )
+
+    def test_several_who_join_together_are_named_together(self) -> None:
+        joining = json.dumps({"feedType": 4, "members": [{"nickName": "하나"}, {"nickName": "둘"}]})
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, joining, None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(
+                reader.feed_details(DIRECT_ROOM, [7002]), {7002: "하나님, 둘님이 입장하셨습니다."}
+            )
+
+    def test_a_feed_with_nothing_to_add_adds_nothing(self) -> None:
+        hiding = json.dumps({"feedType": 21, "logId": 7001, "hidden": True})
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, hiding, None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(reader.feed_details(DIRECT_ROOM, [7002]), {7002: "21"})
+
+    def test_a_row_that_is_not_json_is_left_alone(self) -> None:
+        """A photo shows no text either, and what it stores is not JSON."""
+        messages = [(7002, DIRECT_ROOM, PEER_ID, 0, "not json", None, 1_700_000_001, 0)]
+        with build_reader(messages=messages) as reader:
+            self.assertEqual(reader.feed_details(DIRECT_ROOM, [7002]), {})
+
+    def test_nothing_asked_about_is_nothing_read(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.feed_details(DIRECT_ROOM, []), {})
+
+    def test_the_self_chat_is_named_as_such(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(room_of(reader, SELF_ROOM).title, "나와의 채팅")
+
+    def test_room_kinds_are_stable_names_an_agent_can_branch_on(self) -> None:
+        with build_reader() as reader:
+            kinds = {room.id: room.kind for room in reader.rooms()}
+        self.assertEqual(kinds[DIRECT_ROOM], "direct")
+        self.assertEqual(kinds[GROUP_ROOM], "group")
+        self.assertEqual(kinds[SELF_ROOM], "self")
+        self.assertEqual(kinds[OPEN_ROOM], "open-group")
+
+    def test_room_type_code_is_reported_without_deciding_the_kind(self) -> None:
+        with build_reader() as reader:
+            reader.connection().execute("UPDATE NTChatRoom SET type = 999 WHERE chatId = ?", (DIRECT_ROOM,))
+            room = room_of(reader, DIRECT_ROOM)
+        self.assertEqual(room.kind, "direct")
+        self.assertEqual(room.as_json()["typeCode"], 999)
+
+    def test_an_unknown_room_id_is_absent_rather_than_fabricated(self) -> None:
+        with build_reader() as reader:
+            self.assertIsNone(reader.room(424242))
+
+    def test_pseudo_rooms_with_negative_id_are_excluded(self) -> None:
+        """KakaoTalk keeps internal pseudo-rooms (such as Room -2 for thread notifications) in NTChatRoom."""
+        with build_reader() as reader:
+            before_count = reader.count_rooms()
+            reader.connection().execute(
+                "INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastUpdatedAt) "
+                "VALUES (-2, 10001, NULL, 0, 9999999)"
+            )
+            rooms = reader.rooms()
+            self.assertNotIn(-2, [r.id for r in rooms])
+            self.assertIsNone(reader.room(-2))
+            self.assertEqual(reader.count_rooms(), before_count)
+
+    def test_hidden_rooms_are_excluded_when_column_present(self) -> None:
+        with build_reader() as reader:
+            reader.connection().execute("ALTER TABLE NTChatRoom ADD COLUMN hidden INTEGER")
+            reader.connection().execute(
+                "INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastUpdatedAt, hidden) "
+                "VALUES (9999, 1, 'Hidden Room', 2, 8888888, 1)"
+            )
+            before_count = reader.count_rooms()
+            reader.connection().execute(
+                "INSERT INTO NTChatRoom (chatId, type, chatName, activeMembersCount, lastUpdatedAt, hidden) "
+                "VALUES (9998, 1, 'Normal Room', 2, 8888889, 0)"
+            )
+            rooms = reader.rooms()
+            self.assertNotIn(9999, [r.id for r in rooms])
+            self.assertIn(9998, [r.id for r in rooms])
+            self.assertIsNone(reader.room(9999))
+            self.assertIsNotNone(reader.room(9998))
+            self.assertEqual(reader.count_rooms(), before_count + 1)
+
+
+class ResolutionTests(unittest.TestCase):
+    def test_an_exact_title_wins_over_a_longer_one_containing_it(self) -> None:
+        with build_reader() as reader:
+            matches = reader.resolve("Named Group")
+        self.assertEqual([room.id for room in matches], [NAMED_ROOM])
+
+    def test_matching_ignores_case(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual([room.id for room in reader.resolve("nAmEd gRoUp")], [NAMED_ROOM])
+
+    def test_every_partial_match_is_returned_so_the_caller_can_refuse(self) -> None:
+        with build_reader() as reader:
+            matches = reader.resolve("e")
+        self.assertGreater(len(matches), 1)
+
+    def test_no_match_returns_nothing_rather_than_a_nearest_guess(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.resolve("no such conversation"), [])
+
+
+class MessageTests(unittest.TestCase):
+    def test_messages_are_returned_oldest_first(self) -> None:
+        with build_reader() as reader:
+            found = reader.messages(DIRECT_ROOM)
+        self.assertEqual([message.id for message in found], [5000, 5001, 5003])
+
+    def test_deleted_messages_are_not_returned(self) -> None:
+        with build_reader() as reader:
+            self.assertNotIn(5002, [message.id for message in reader.messages(DIRECT_ROOM)])
+
+    def test_the_limit_keeps_the_newest_messages(self) -> None:
+        with build_reader() as reader:
+            found = reader.messages(DIRECT_ROOM, limit=2)
+        self.assertEqual([message.id for message in found], [5001, 5003])
+
+    def test_the_users_own_messages_are_marked(self) -> None:
+        with build_reader() as reader:
+            by_id = {message.id: message for message in reader.messages(DIRECT_ROOM)}
+        self.assertTrue(by_id[5001].from_me)
+        self.assertFalse(by_id[5000].from_me)
+
+    def test_senders_are_named_including_the_user(self) -> None:
+        with build_reader() as reader:
+            by_id = {message.id: message for message in reader.messages(DIRECT_ROOM)}
+        self.assertEqual(by_id[5001].sender, "My Own Name")
+        self.assertEqual(by_id[5000].sender, "Peer Renamed")
+
+    def test_paging_backwards_returns_only_older_messages(self) -> None:
+        with build_reader() as reader:
+            found = reader.messages(DIRECT_ROOM, before_id=5001)
+        self.assertEqual([message.id for message in found], [5000])
+
+    def test_following_forwards_returns_only_newer_messages(self) -> None:
+        with build_reader() as reader:
+            found = reader.messages(DIRECT_ROOM, after_id=5001)
+        self.assertEqual([message.id for message in found], [5003])
+
+    def test_counting_excludes_deleted_messages(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.count_messages(DIRECT_ROOM), 3)
+
+    def test_a_borrowed_cache_outlives_the_reader_that_used_it(self) -> None:
+        """Whoever built the cache closes it, because sharing is the point.
+
+        ``serve`` hands one cache to a reader per send. A reader that closed it
+        on the way out would put the whole decryption back on every request --
+        the 2.5 s that sharing exists to avoid -- and would do it silently,
+        since the next reader simply decrypts again and answers correctly.
+        """
+        cache, keyring = build_profile()
+        first = Reader(cache=cache, keyring=keyring)  # type: ignore[arg-type]
+        self.assertTrue(first.rooms())
+        first.close()
+
+        second = Reader(cache=cache, keyring=keyring)  # type: ignore[arg-type]
+        self.addCleanup(second.close)
+        self.assertTrue(
+            second.rooms(), "the first reader closed a cache it had only borrowed"
+        )
+
+    def test_a_reader_still_closes_the_cache_it_made_itself(self) -> None:
+        import kamado.reader as reader_module
+
+        original = reader_module.SnapshotCache  # bound before patching
+        closed: list = []
+
+        class _Recording(original):  # type: ignore[misc,valid-type]
+            def close(self) -> None:
+                closed.append(True)
+                super().close()
+
+        reader_module.SnapshotCache = _Recording
+        self.addCleanup(setattr, reader_module, "SnapshotCache", original)
+
+        Reader().close()
+        self.assertEqual(closed, [True])
+
+    def test_the_newest_id_is_available_without_reading_bodies(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.newest_log_id(DIRECT_ROOM), 5003)
+
+    def test_the_newest_id_ignores_a_deleted_row(self) -> None:
+        """The follow cursor must name a message the reader can actually return.
+
+        Every other query excludes deleted rows, so a newest id that counts
+        one hands the watcher a position it will never read a message at.
+        """
+        cache, keyring = build_profile()
+        reader = Reader(cache=cache, keyring=keyring)
+        self.addCleanup(reader.close)
+        cache.database.execute(
+            "INSERT INTO NTChatMessage "
+            "(logId, chatId, authorId, type, message, attachment, sentAt, deleted) "
+            "VALUES (5004, ?, ?, 1, 'withdrawn', NULL, ?, 1)",
+            (DIRECT_ROOM, PEER_ID, 1_700_000_400),
+        )
+        cache.database.commit()
+
+        self.assertEqual(reader.newest_log_id(DIRECT_ROOM), 5003)
+
+    def test_catching_up_after_a_cursor_starts_at_the_oldest_unseen_message(self) -> None:
+        """A page cut from the newest end would skip everything below it.
+
+        Asked what arrived after a known message, a caller advances its
+        cursor past whatever it is handed, so a page taken from the far end
+        loses the gap between the cursor and that page for good.
+        """
+        cache, keyring = build_profile()
+        reader = Reader(cache=cache, keyring=keyring)
+        self.addCleanup(reader.close)
+        cache.database.executemany(
+            "INSERT INTO NTChatMessage "
+            "(logId, chatId, authorId, type, message, attachment, sentAt, deleted) "
+            "VALUES (?, ?, ?, 1, ?, NULL, ?, 0)",
+            [
+                (log_id, DIRECT_ROOM, PEER_ID, f"burst {log_id}", 1_700_001_000 + log_id)
+                for log_id in range(5200, 5210)
+            ],
+        )
+        cache.database.commit()
+
+        found = reader.messages(DIRECT_ROOM, limit=4, after_id=5003)
+        self.assertEqual([message.id for message in found], [5200, 5201, 5202, 5203])
+
+    def test_identifiers_past_two_to_the_fifty_third_survive_as_strings(self) -> None:
+        with build_reader() as reader:
+            found = reader.messages(HUGE_ROOM)
+        rendered = found[0].as_json()
+        self.assertEqual(rendered["id"], str(HUGE_ID))
+        self.assertEqual(rendered["roomId"], str(HUGE_ROOM))
+        self.assertEqual(int(rendered["id"]), HUGE_ID)
+
+    def test_a_stored_room_without_messages_reads_as_empty(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(reader.messages(NAMED_ROOM), [])
+
+
+class SearchTests(unittest.TestCase):
+    def test_finds_matches_across_readable_rooms(self) -> None:
+        with build_reader() as reader:
+            found = list(reader.search("group hello"))
+        self.assertEqual([message.room_id for message in found], [GROUP_ROOM])
+
+    def test_no_matching_text_returns_no_messages(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(list(reader.search("nothing matches this")), [])
+
+    def test_a_limit_of_zero_searches_nothing(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(list(reader.search("first", limit=0)), [])
+
+    def test_deleted_messages_are_not_searchable(self) -> None:
+        with build_reader() as reader:
+            self.assertEqual(list(reader.search("removed")), [])
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_reports_a_ready_account_without_a_running_client(self) -> None:
+        with build_reader() as reader:
+            status = reader.status()
+        self.assertEqual(status, {
+            "ready": True, "account": str(OWN_ID), "database": DATABASE.name,
+            "rooms": 6, "detail": "ready",
+        })
+
+    def test_status_explains_an_unresolved_account_instead_of_failing(self) -> None:
+        with build_reader() as reader:
+            reader._keyring = Keyring(CONTAINER, [DATABASE], None)
+            status = reader.status()
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["rooms"], 0)
+        self.assertIsNone(status["account"])
+        self.assertIsNone(status["database"])
+
+    def test_status_uses_cached_rooms_when_database_fingerprint_matches(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from tests.fixtures import build_reader_on_disk
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            reader, _stub = build_reader_on_disk(root)
+            first = reader.status()
+            self.assertEqual(first["rooms"], 6)
+
+            # Re-running status should hit cache without calling count_rooms
+            with unittest.mock.patch.object(reader, "count_rooms", side_effect=AssertionError("called count_rooms")):
+                second = reader.status()
+            self.assertEqual(second, first)
+
+
+class StatusCacheKeyTests(unittest.TestCase):
+    """A cached room count answers only for the account and state it was counted from."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from tests.fixtures import build_reader_on_disk
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.reader, self.stub = build_reader_on_disk(self.root / "profile")
+        self.cache_file = self.root / "status.json"
+        patcher = unittest.mock.patch.object(
+            self.reader, "_status_cache_file", return_value=self.cache_file
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def counted(self) -> int:
+        calls = {"count": 0}
+        real = self.reader.count_rooms
+
+        def counting() -> int:
+            calls["count"] += 1
+            return real()
+
+        with unittest.mock.patch.object(self.reader, "count_rooms", side_effect=counting):
+            self.reader.status()
+        return calls["count"]
+
+    def test_a_change_only_the_log_saw_is_counted_again(self) -> None:
+        """A room added while the client runs lands in the log, not the file."""
+        self.assertEqual(self.counted(), 1)
+        log = self.reader.database.with_name(self.reader.database.name + "-wal")
+        log.write_bytes(log.read_bytes() + b"a room was added")
+        self.assertEqual(self.counted(), 1, "a log-only change reused the old count")
+
+    def test_an_unchanged_state_reuses_the_count(self) -> None:
+        self.assertEqual(self.counted(), 1)
+        self.assertEqual(self.counted(), 0)
+
+    def test_another_account_is_not_handed_this_ones_count(self) -> None:
+        self.reader.status()
+        stored = json.loads(self.cache_file.read_text("utf-8"))
+        stored["account"] = "someone-else"
+        self.cache_file.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertEqual(self.counted(), 1)
+
+    def test_a_count_is_filed_under_the_state_it_was_counted_from(self) -> None:
+        log = self.reader.database.with_name(self.reader.database.name + "-wal")
+        real = self.reader.count_rooms
+
+        def moving() -> int:
+            answer = real()
+            log.write_bytes(log.read_bytes() + b"written while counting")
+            return answer
+
+        with unittest.mock.patch.object(self.reader, "count_rooms", side_effect=moving):
+            self.reader.status()
+        self.assertEqual(self.counted(), 1, "a count was filed under a later state")
+
+    def test_a_damaged_cache_is_a_miss(self) -> None:
+        self.reader.status()
+        for damaged in ("not json", "[]", json.dumps({"rooms": "six"})):
+            with self.subTest(damaged=damaged):
+                self.cache_file.write_text(damaged, encoding="utf-8")
+                self.assertEqual(self.counted(), 1)
+        stored = json.loads(self.cache_file.read_text("utf-8"))
+        stored["rooms"] = None
+        self.cache_file.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertEqual(self.counted(), 1)
+
+
+class StatusFailureTests(unittest.TestCase):
+    def test_an_unresolved_account_names_the_reason_a_read_fails(self) -> None:
+        with build_reader() as reader:
+            reader._keyring = Keyring(CONTAINER, [DATABASE], None)
+            with self.assertRaises(KamadoError) as raised:
+                reader.rooms()
+        self.assertEqual(raised.exception.code, ErrorCode.KEY_UNAVAILABLE)
+
+
+class MembershipFeedTests(unittest.TestCase):
+    """A feed row is the client's bookkeeping, and must not read as speech.
+
+    Its ``message`` column holds JSON. One live open chat had 364 of these in
+    its newest 400 records, so passing that through as message text buries the
+    conversation on screen and hands an agent a wall of ``{"feedType": …}`` to
+    reason over.
+    """
+
+    def rows(self):
+        from tests.test_names import feed
+
+        return [
+            feed(20, 1_700_000_000, (PEER_ID, "예전 이름")),
+            (21, DIRECT_ROOM, PEER_ID, 1, "사람이 쓴 줄", None, 1_700_000_100, 0),
+        ]
+
+    def test_a_feed_carries_no_message_text(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            found = {message.id: message for message in reader.messages(DIRECT_ROOM)}
+        self.assertEqual(found[20].text, "")
+        self.assertEqual(found[21].text, "사람이 쓴 줄")
+
+    def test_a_feed_is_named_rather_than_left_as_a_type_number(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            rendered = reader.messages(DIRECT_ROOM)[0].as_json()
+        self.assertEqual(rendered["kind"], "feed")
+        self.assertEqual(rendered["text"], "")
+
+    def test_the_names_a_feed_records_are_still_read(self) -> None:
+        """The history comes from the database, not from the message text."""
+        with build_reader(messages=self.rows()) as reader:
+            history = reader.name_history(DIRECT_ROOM)
+        self.assertIn(PEER_ID, history)
+        self.assertIn("예전 이름", [record.name for record in history[PEER_ID]])
+
+    def test_a_feed_cannot_be_found_by_searching_for_its_json(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            self.assertEqual(list(reader.search("feedType")), [])
+
+
+class NewcomerNameTests(unittest.TestCase):
+    """Somebody who joins after the room was read is not left as a number.
+
+    The name map is read once per reader and the interface keeps its reader
+    for as long as it runs, so a newcomer stayed ``User <id>`` until the room
+    was opened again — when a fresh read found them.
+    """
+
+    NEWCOMER = 555000111
+
+    def rows(self, feed_name=None):
+        rows = [(7100, DIRECT_ROOM, self.NEWCOMER, 1, "안녕하세요", None, 1_700_001_000, 0)]
+        if feed_name is not None:
+            feed = {"feedType": 4, "members": [{"userId": self.NEWCOMER, "nickName": feed_name}]}
+            rows.insert(0, (7099, DIRECT_ROOM, self.NEWCOMER, 0, json.dumps(feed), None, 1_700_000_990, 0))
+        return rows
+
+    def newest(self, reader) -> str:
+        return reader.messages(DIRECT_ROOM, limit=50)[-1].sender
+
+    def test_a_name_that_arrives_later_is_found_on_the_next_read(self) -> None:
+        from kamado import reader as reader_module
+
+        with build_reader(messages=self.rows()) as reader:
+            self.assertEqual(self.newest(reader), f"User {self.NEWCOMER}")
+            connection = reader.connection()
+            connection.execute(
+                "INSERT INTO NTUser (userId, type, nickName) VALUES (?, 1000, ?)",
+                (self.NEWCOMER, "새로 온 사람"),
+            )
+            connection.commit()
+            reader._names_read_at -= reader_module.NAME_RETRY_SECONDS
+            self.assertEqual(self.newest(reader), "새로 온 사람")
+
+    def test_the_join_feed_names_somebody_the_profile_does_not(self) -> None:
+        with build_reader(messages=self.rows(feed_name="입장한 닉")) as reader:
+            self.assertEqual(self.newest(reader), "입장한 닉")
+
+    def test_the_map_is_not_reread_for_every_line(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            reader.names()
+            before = reader._names
+            self.newest(reader)
+            self.assertIs(reader._names, before, "the map was read again inside the retry window")
+
+
+class ErasedMessageTests(unittest.TestCase):
+    """A message deleted for everyone keeps its text; the type says it is gone.
+
+    ``deleted`` stays 0 and 0x4000 is added to the type, and the client writes
+    a ``feedType`` 14 row pointing at it. Both used to reach the screen: the
+    deleted line as if it still stood, and a bare ``[feed 14]`` beside it.
+    """
+
+    def rows(self):
+        erased = json.dumps({"feedType": 14, "logId": 7101, "hidden": True})
+        return [
+            (7100, DIRECT_ROOM, PEER_ID, 1, "남은 말", None, 1_700_001_000, 0),
+            (7101, DIRECT_ROOM, OWN_ID, 0x4000 | 1, "지운 말", None, 1_700_001_010, 0),
+            (7102, DIRECT_ROOM, OWN_ID, 0, erased, None, 1_700_001_020, 0),
+        ]
+
+    def test_an_erased_message_is_not_part_of_the_conversation(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            found = reader.messages(DIRECT_ROOM, limit=50)
+        self.assertEqual([message.id for message in found], [7100])
+
+    def test_a_follower_is_never_pointed_at_what_was_hidden(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            self.assertEqual(reader.newest_log_id(DIRECT_ROOM), 7100)
+
+    def test_the_interface_is_given_the_gap_but_never_the_text(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            found = reader.messages(DIRECT_ROOM, limit=50, include_erased=True)
+        self.assertEqual([message.id for message in found], [7100, 7101])
+        self.assertTrue(found[1].erased)
+        self.assertEqual(found[1].text, "")
+        self.assertNotIn("지운 말", [message.text for message in found])
+        self.assertTrue(all("erased" not in message.as_json() for message in found))
+
+    def test_an_erased_message_is_not_found_by_search(self) -> None:
+        with build_reader(messages=self.rows()) as reader:
+            self.assertEqual(list(reader.search("지운")), [])
+
+    def test_other_feeds_are_still_shown(self) -> None:
+        joining = json.dumps({"feedType": 4, "members": [{"userId": PEER_ID, "nickName": "합성 닉"}]})
+        rows = self.rows() + [(7103, DIRECT_ROOM, PEER_ID, 0, joining, None, 1_700_001_030, 0)]
+        with build_reader(messages=rows) as reader:
+            found = reader.messages(DIRECT_ROOM, limit=50)
+        self.assertEqual([message.id for message in found], [7100, 7103])
+
+    def test_a_feed_body_that_is_not_json_does_not_fail_the_read(self) -> None:
+        rows = self.rows() + [(7104, DIRECT_ROOM, PEER_ID, 0, "not json", None, 1_700_001_040, 0)]
+        with build_reader(messages=rows) as reader:
+            found = reader.messages(DIRECT_ROOM, limit=50)
+        self.assertEqual([message.id for message in found], [7100, 7104])
+
+
+def _new_snapshot(cache: StubCache) -> sqlite3.Connection:
+    """Hand the reader a fresh copy of its database, as a changed file would.
+
+    The real cache returns a new connection exactly when the file changed, so
+    a swapped-in copy is what "this database moved" looks like to a reader.
+    """
+    copy = sqlite3.connect(":memory:")
+    cache.database.backup(copy)
+    cache.database = copy
+    return copy
+
+
+def _stub_reader() -> tuple[Reader, StubCache]:
+    cache, keyring = build_profile()
+    return Reader(cache=cache, keyring=keyring), cache
+
+
+class _FailingOnce:
+    """A cache whose first connect fails the way a busy snapshot does."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.failures = 1
+
+    def connect(self, database, geometry):
+        if self.failures:
+            self.failures -= 1
+            raise KamadoError(ErrorCode.BUSY, "synthetic busy snapshot")
+        return self.inner.connect(database, geometry)
+
+    def invalidate(self, database) -> None:
+        self.inner.invalidate(database)
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+class IdentityRetryTests(unittest.TestCase):
+    """A failure to look for the account is not proof that there is none."""
+
+    def test_a_failed_first_look_is_asked_again(self) -> None:
+        cache, keyring = build_profile()
+        reader = Reader(cache=_FailingOnce(cache), keyring=keyring)
+        self.addCleanup(cache.close)
+        with self.assertRaises(KamadoError):
+            reader.own_user_id()
+        self.assertEqual(reader.own_user_id(), OWN_ID)
+        by_id = {message.id: message for message in reader.messages(DIRECT_ROOM)}
+        self.assertTrue(by_id[5001].from_me)
+
+    def test_a_failed_first_look_is_not_settled(self) -> None:
+        cache, keyring = build_profile()
+        reader = Reader(cache=_FailingOnce(cache), keyring=keyring)
+        self.addCleanup(cache.close)
+        with self.assertRaises(KamadoError):
+            reader.own_user_id()
+        self.assertFalse(reader._own_id_resolved)
+
+
+class NameLifetimeTests(unittest.TestCase):
+    """The name shown is the one the user carries now, not at startup."""
+
+    def senders(self, reader: Reader) -> dict[int, str]:
+        return {message.id: message.sender for message in reader.messages(DIRECT_ROOM)}
+
+    def test_a_known_user_who_renamed_is_shown_under_the_new_name(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        self.assertEqual(self.senders(reader)[5000], "Peer Renamed")
+        copy = _new_snapshot(cache)
+        copy.execute(
+            "UPDATE NTUser SET friendNickName = ? WHERE userId = ?", ("Peer Again", PEER_ID)
+        )
+        copy.commit()
+        self.assertEqual(self.senders(reader)[5000], "Peer Again")
+        self.assertEqual(reader.names()[PEER_ID], "Peer Again")
+
+    def test_an_unchanged_snapshot_is_not_read_again(self) -> None:
+        with build_reader() as reader:
+            first = reader.names()
+            reader.messages(DIRECT_ROOM)
+            reader.rooms()
+            self.assertIs(reader.names(), first)
+
+    def test_a_failed_look_keeps_the_names_it_had(self) -> None:
+        cache, keyring = build_profile()
+        failing = _FailingOnce(cache)
+        failing.failures = 0
+        reader = Reader(cache=failing, keyring=keyring)
+        self.addCleanup(cache.close)
+        first = reader.names()
+        failing.failures = 1
+        with self.assertRaises(KamadoError):
+            reader.messages(DIRECT_ROOM)
+        self.assertIs(reader.names(), first)
+
+
+class RowVersionTests(unittest.TestCase):
+    """How a caller holding messages learns that one of them changed."""
+
+    def test_a_version_moves_when_a_row_changes_and_only_then(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        before = reader.row_versions(DIRECT_ROOM, 5000, 5003)
+        self.assertEqual(set(before), {5000, 5001, 5003})
+        self.assertEqual(reader.row_versions(DIRECT_ROOM, 5000, 5003), before)
+        cache.database.execute("UPDATE NTChatMessage SET message = 'edited' WHERE logId = 5001")
+        cache.database.commit()
+        after = reader.row_versions(DIRECT_ROOM, 5000, 5003)
+        self.assertNotEqual(after[5001], before[5001])
+        self.assertEqual(after[5000], before[5000])
+
+    def test_versions_read_with_messages_match_the_range_read(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        found, versions = reader.messages_at(DIRECT_ROOM, [5000, 5001, 5003])
+        self.assertEqual([message.id for message in found], [5000, 5001, 5003])
+        self.assertEqual(versions, reader.row_versions(DIRECT_ROOM, 5000, 5003))
+
+    def test_a_row_no_longer_returned_has_no_version(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        cache.database.execute("UPDATE NTChatMessage SET deleted = 1 WHERE logId = 5000")
+        cache.database.commit()
+        self.assertNotIn(5000, reader.row_versions(DIRECT_ROOM, 5000, 5003))
+        found, _versions = reader.messages_at(DIRECT_ROOM, [5000, 5003])
+        self.assertEqual([message.id for message in found], [5003])
+
+    def test_an_erased_row_is_versioned_only_when_asked_to_keep_it(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        cache.database.execute("UPDATE NTChatMessage SET type = type | 16384 WHERE logId = 5003")
+        cache.database.commit()
+        self.assertNotIn(5003, reader.row_versions(DIRECT_ROOM, 5000, 5003))
+        self.assertIn(5003, reader.row_versions(DIRECT_ROOM, 5000, 5003, include_erased=True))
+
+    def test_other_rooms_are_not_versioned(self) -> None:
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        self.assertEqual(reader.row_versions(DIRECT_ROOM, 0, 10_000), reader.row_versions(DIRECT_ROOM, 5000, 5003))
+
+
+class SchemaLifetimeTests(unittest.TestCase):
+    def test_a_column_the_database_gains_is_seen_on_the_next_snapshot(self) -> None:
+        """Columns are asked for again once the file has changed."""
+        reader, cache = _stub_reader()
+        self.addCleanup(cache.close)
+        self.assertNotIn("added", reader.columns("NTChatMessage"))
+        copy = _new_snapshot(cache)
+        copy.execute("ALTER TABLE NTChatMessage ADD COLUMN added INTEGER")
+        copy.commit()
+        reader.messages(DIRECT_ROOM)
+        self.assertIn("added", reader.columns("NTChatMessage"))
+
+
+if __name__ == "__main__":
+    unittest.main()

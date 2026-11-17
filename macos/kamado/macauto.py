@@ -1,0 +1,1228 @@
+"""Exact window targeting, draft replacement, and text submission.
+
+The accessibility tree addresses one composer and one send button inside
+one window. Clients without a send button need a process-directed Return,
+guarded by the focused composer's identity, window and placed text.
+
+* **The button path leaves the desktop alone.** Discovery never raises a
+  window. The Return fallback activates the client and focuses the composer.
+  Explicitly opening a closed room also activates the client and clicks its list.
+* **The text is written, not typed.**  Setting the input's value in one call is
+  atomic from the client's point of view, where a synthesised keystroke per
+  character is a race against the IME and against the user.
+* **A send is one button press or a guarded Return.**
+* **An unfinished draft is cleared, not refused**, and the clearing is reported
+  — ``clearedDraft`` on a send, ``wouldClearDraft`` on a dry run — because
+  losing somebody's half-typed line silently is the indefensible part.
+* **Queue acceptance is not delivery.**  ``submitted`` means the client
+  accepted the text, and nothing here claims more than that.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from typing import Callable, Iterable, Literal, Optional, Protocol, TypedDict
+
+from . import ax, paths
+from .errors import ErrorCode, KamadoError
+
+BUNDLE_ID = paths.BUNDLE_ID
+EXECUTABLE = "/Applications/KakaoTalk.app/Contents/MacOS/KakaoTalk"
+
+MAIN_WINDOW_IDENTIFIER = "Main Window"
+"""What the client calls its own main window, login screen or not."""
+
+_INPUT_ROLES = ("AXTextArea", "AXTextField")
+_EMPTY_HINTS = ("메시지 입력", "Enter message", "")
+"""What an empty message box reads as rather than as a draft.
+
+The Korean client writes its placeholder into the value, so a literal match is
+what tells an empty box apart from a one-word draft.
+"""
+
+_OPEN_TIMEOUT_SECONDS = 6.0
+_OPEN_POLL_SECONDS = 0.1
+_SEARCHED_ROWS = 8
+
+_WRITE_ATTEMPTS = 3
+"""How many times to write the message before giving up on the composer."""
+
+_SETTLE_SECONDS = 0.2
+"""Long enough for the client to act on a write, and no longer."""
+
+_WAIT_SECONDS = 3.0
+"""How long to wait for the send button to enable, and for the box to empty."""
+
+_POLL_SECONDS = 0.005
+"""Gap between those polls; an accessibility read is cheap."""
+
+_ACTIVATE_SECONDS = 0.6
+"""How long the client needs to actually come forward before it can be clicked."""
+
+_SEARCH_SECONDS = 6.0
+"""How long the client may take to answer a search with its whole room list."""
+
+_SEARCH_ROW_LIMIT = 2000
+"""How many rows of that list are worth reading before giving up.
+
+Each row's name is one accessibility round trip: 648 of them measured 10.3 s,
+and the wanted room was row 116. The limit is a stop, not a budget.
+"""
+
+_SEND_BUTTON_TITLES = ("전송", "Send")
+"""The chat window's send button, pressed to commit a message.
+
+Prefer the button when exposed. Clients without it use a focus-checked Return."""
+
+
+@dataclass(frozen=True)
+class ChatWindow:
+    """One open KakaoTalk chat window."""
+
+    handle: int
+    title: str
+
+
+class _Submission(TypedDict):
+    submitted: bool
+    dryRun: bool
+    room: str
+    length: int
+
+
+class SendResult(_Submission, total=False):
+    """What a send reports, plus the two keys that only sometimes apply.
+
+    `clearedDraft` and `wouldClearDraft` are written by this module and were
+    not declared here, so the very returns below did not match the type they
+    claimed. They are optional rather than required because a caller reads one
+    or the other, never both: the dry run says what *would* be lost.
+    """
+
+    clearedDraft: bool
+    wouldClearDraft: bool
+
+
+class MessageSender(Protocol):
+    """The one call an interface needs; :class:`Sender` satisfies it."""
+
+    def send(
+        self,
+        room: str,
+        text: str,
+        dry_run: bool = False,
+        open_if_needed: bool = False,
+        aliases: Iterable[str] = (),
+        hint: Optional[int] = None,
+    ) -> SendResult:
+        ...
+
+
+class WindowBackend(Protocol):
+    """Everything the sender needs from the windowing system."""
+
+    def chat_windows(self, hit_test: bool = True) -> list[ChatWindow]:
+        """Return KakaoTalk's open chat windows (excluding the main window).
+
+        ``hit_test=False`` reads only the AX window lists, which is enough
+        whenever the target is listed and skips probing every window's centre.
+        """
+        ...
+
+    def input_handle(self, window: int) -> Optional[int]:
+        """Return the message-input control inside a chat window, if present."""
+        ...
+
+    def get_text(self, control: int) -> str:
+        """Read the draft without changing it."""
+        ...
+
+    def set_text(self, control: int, text: str) -> None:
+        """Replace the input's text."""
+        ...
+
+    def submit(self, control: int) -> None:
+        """Submit this input through its own window's send control."""
+        ...
+
+
+class RoomListBackend(Protocol):
+    """What opening a room needs: the list, a row, and a way to undo it."""
+
+    def chat_windows(self) -> list[ChatWindow]:
+        ...
+
+    def room_rows(self) -> list[str]:
+        """Return the titles of the rows in the main window's room list."""
+        ...
+
+    def open_row(self, row: int) -> bool:
+        """Open one row of the room list, without moving the cursor."""
+        ...
+
+    def locate_row(self, wanted: set[str]) -> Optional[int]:
+        """Find a row for any of *wanted*, through the client's own search.
+
+        The index is only meaningful until :meth:`clear_row_filter` puts the
+        list back, because the list it counts is not the one normally shown.
+        """
+        ...
+
+    def clear_row_filter(self) -> None:
+        """Put the room list back the way it was found."""
+        ...
+
+    def main_state(self) -> str:
+        """Report the main window as "visible", "minimized", "hidden" or "missing"."""
+        ...
+
+    def show_main_window(self) -> bool:
+        """Bring the main window back. True when it is up."""
+        ...
+
+    def restore_main_window(self, state: str) -> None:
+        """Put the main window back the way it was found."""
+        ...
+
+    def minimize_window(self, handle: int) -> None:
+        """Park a window where it covers nothing."""
+        ...
+
+    def close_window(self, handle: int) -> None:
+        """Close a chat window that was opened by mistake."""
+        ...
+
+
+def outward(hint: Optional[int], total: int) -> Iterable[int]:
+    """Every row index once, nearest *hint* first: hint, hint+1, hint-1, …
+
+    None for a list with no rows: with the friends tab in front the chat list
+    is not in the tree at all, and reading its row 0 raised IndexError.
+    """
+    if total <= 0:
+        return
+    start = hint if hint is not None and 0 <= hint < total else 0
+    yield start
+    for step in range(1, total):
+        for index in (start + step, start - step):
+            if 0 <= index < total:
+                yield index
+
+
+def client_pid(runner=subprocess.run) -> Optional[int]:
+    """Return the running client's process id, or None when it is closed."""
+    try:
+        completed = runner(
+            ["/usr/bin/pgrep", "-f", EXECUTABLE], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (completed.stdout or "").split():
+        if line.isdigit():
+            return int(line)
+    return None
+
+
+def running(runner=subprocess.run) -> bool:
+    """Whether the KakaoTalk client is running at all."""
+    return client_pid(runner) is not None
+
+
+def client_session() -> Literal["closed", "signed-in", "logged-out", "unknown"]:
+    """Read the main window's login shape, without opening or focusing it.
+
+    A missing window or permission is not proof of login. Never read a field's
+    value (it may hold an email), or walk the rows beneath a chat table.
+    """
+    pid = client_pid()
+    if pid is None:
+        return "closed"
+    if not ax.is_trusted():
+        return "unknown"
+    deadline = time.monotonic() + 3.0
+
+    def attribute(element, name):
+        # The deadline stops new IPC; one in-flight read may take the AX
+        # messaging timeout (5 s). Do not call windows(), which reads per row.
+        if time.monotonic() >= deadline:
+            raise TimeoutError("session inspection deadline")
+        return element.attribute(name)
+
+    try:
+        app = ax.application(pid)
+        windows = list(attribute(app, "AXWindows") or [])
+        for window in attribute(app, "AXChildrenInNavigationOrder") or []:
+            if attribute(window, "AXRole") == "AXWindow" and not any(
+                window.same_as(known) for known in windows
+            ):
+                windows.append(window)
+        for name in ("AXMainWindow", "AXFocusedWindow"):
+            window = attribute(app, name)
+            if isinstance(window, ax.Element) and not any(
+                window.same_as(known) for known in windows
+            ):
+                windows.append(window)
+        pending = []
+        for window in windows:
+            if attribute(window, "AXIdentifier") == MAIN_WINDOW_IDENTIFIER:
+                pending.append((window, 0))
+        visited = 0
+        password = login = False
+        while pending and visited < 30 and time.monotonic() < deadline:
+            node, depth = pending.pop(0)
+            visited += 1
+            role = attribute(node, "AXRole")
+            if role == "AXTable":
+                return "signed-in"
+            if attribute(node, "AXSubrole") == "AXSecureTextField":
+                password = True
+            if role == "AXButton" and attribute(node, "AXTitle") in (
+                "로그인", "Log In", "Login",
+            ):
+                login = True
+            if password and login:
+                return "logged-out"
+            if depth < 4:
+                pending.extend(
+                    (child, depth + 1) for child in attribute(node, "AXChildren") or []
+                )
+    except (RuntimeError, OSError):
+        return "unknown"
+    return "unknown"
+
+
+def activate(runner=subprocess.run) -> None:
+    """Bring KakaoTalk forward.
+
+    The guarded Return fallback needs this. Opening a *closed* room does too: its chat-list rows
+    ignore both ``AXPress`` and a posted Return, so the only thing that opens
+    one is a real double-click, and a click at screen coordinates is only safe
+    aimed at the window in front.
+    """
+    try:
+        runner(["/usr/bin/open", "-b", BUNDLE_ID], check=False)
+    except (OSError, subprocess.SubprocessError):
+        return
+    time.sleep(_ACTIVATE_SECONDS)
+
+
+# -- remembered rows ---------------------------------------------------------
+
+
+def _remembered_rows() -> Path:
+    return paths.state_directory() / "rows.json"
+
+
+def _row_key(room: str) -> str:
+    """Hash a room title, so the memory never holds one in the clear."""
+    return sha256(room.strip().casefold().encode("utf-8")).hexdigest()[:32]
+
+
+def _recall_row(path: Path, room: str) -> int:
+    try:
+        stored = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return -1
+    if not isinstance(stored, dict):
+        return -1
+    value = stored.get(_row_key(room))
+    return value if isinstance(value, int) and value >= 0 else -1
+
+
+def _learn_row(path: Path, room: str, row: int) -> None:
+    try:
+        stored = json.loads(path.read_text("utf-8"))
+        if not isinstance(stored, dict):
+            stored = {}
+    except (OSError, ValueError):
+        stored = {}
+    stored[_row_key(room)] = row
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(stored), encoding="utf-8")
+    except OSError:
+        pass
+
+
+class RoomOpener:
+    """Open a closed room and restore the main window's minimized state.
+
+    Unlike the Windows list, which was owner-drawn and could only be addressed
+    by pixel coordinate, the macOS list reports its rows through accessibility
+    with their titles attached.  So a row is matched by name before it is
+    touched, and the guesswork the Windows build needed — alternating between
+    two theories about where a room sits, and closing whatever wrong room it
+    opened — is not needed here.  The remembered row survives only as a way to
+    skip the scan.
+    """
+
+    def __init__(
+        self,
+        backend: RoomListBackend,
+        memory: Optional[Path] = None,
+        sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._backend = backend
+        self._memory = memory if memory is not None else _remembered_rows()
+        self._sleep = sleep
+        self._now = now
+
+    def _matching_window(self, wanted: set[str]) -> Optional[ChatWindow]:
+        for window in self._backend.chat_windows():
+            if window.title.strip().casefold() in wanted:
+                return window
+        return None
+
+    def open(
+        self, room: str, aliases: Iterable[str] = (), hint: Optional[int] = None
+    ) -> ChatWindow:
+        """Open and minimize *room*'s window using the client's visible list."""
+        wanted = {name.strip().casefold() for name in (room, *aliases) if name.strip()}
+        state = self._backend.main_state()
+        already_open = self._matching_window(wanted)
+        if already_open is not None:
+            return already_open
+        # A client with every window closed is still running and still holds
+        # the list; the window simply has to be drawn before it can be read.
+        # That is the minimized case with a longer wait, not a broken install,
+        # so it is asked for here and put back in the same breath below.
+        if state != "visible" and not self._backend.show_main_window():
+            raise KamadoError(
+                ErrorCode.WINDOW_NOT_FOUND,
+                "KakaoTalk's main window could not be brought back to open the room",
+            )
+
+        try:
+            finder = getattr(self._backend, "first_matching_row", None)
+            if finder is not None:
+                # Read from where the catalog says the room sits and stop at
+                # the first match: reading all 264 names cost about 18 s.
+                found, total = finder(wanted, hint)
+                rows = [""] * total
+                order = [] if found is None else [found]
+            else:
+                rows = self._backend.room_rows()
+                order = self._order(room, rows, wanted, hint)
+            for row in order:
+                if not self._backend.open_row(row):
+                    continue
+                window = self._await_window(wanted)
+                if window is not None:
+                    _learn_row(self._memory, room, row)
+                    # Nobody asked for this window to be in front, so it is
+                    # parked the moment it exists.
+                    self._backend.minimize_window(window.handle)
+                    return window
+            found = self._through_search(wanted)
+            if found is not None:
+                return found
+            raise KamadoError(
+                ErrorCode.WINDOW_NOT_FOUND,
+                f"could not open a chat window for {room!r}: the client's list "
+                f"showed {len(rows)} rows and none is that room, with "
+                f"{len(self._backend.chat_windows())} chat windows open. The list "
+                "only exposes rows it has drawn, so open the room once in "
+                "KakaoTalk if its row is unavailable",
+                room=room,
+            )
+        finally:
+            self._backend.restore_main_window(state)
+
+    def _order(
+        self, room: str, rows: list[str], wanted: set[str], hint: Optional[int]
+    ) -> list[int]:
+        """Decide which rows to try, best first.
+
+        A row whose own title matches is tried before anything else, because
+        the list says so; the remembered row and the catalog's recency hint are
+        only fallbacks for a list that did not report its titles.
+        """
+        order: list[int] = [
+            index for index, title in enumerate(rows)
+            if title.strip().casefold() in wanted
+        ]
+        remembered = _recall_row(self._memory, room)
+        if remembered is not None and remembered >= 0 and remembered not in order:
+            order.append(remembered)
+        if any(title.strip() for title in rows):
+            # The list named its rows, so a row it did not name is not this
+            # room. Opening it anyway puts somebody else's conversation on
+            # screen and marks it read, which is worse than failing here.
+            return order
+        # Only a list that named nothing at all leaves the recency hint and a
+        # scan of the first rows worth trying.
+        if hint is not None and hint >= 0 and hint not in order:
+            order.append(hint)
+        order.extend(index for index in range(_SEARCHED_ROWS) if index not in order)
+        return order
+
+    def _through_search(self, wanted: set[str]) -> Optional[ChatWindow]:
+        """Reach a room the drawn list does not hold, through the client's search.
+
+        The list exposes only the rows it has drawn — 26 of 653 rooms on the
+        machine this was measured on — so a conversation further down cannot
+        be clicked at all, however patiently the rows are matched. Typing the
+        name into the client's own search box brings its whole list within
+        reach: the wanted room was found at row 116 of 648 that way.
+
+        What is found there is deliberately not remembered. That index counts
+        rows in a list that exists only while the search does, and clicking it
+        afterwards would open whichever conversation had taken its place.
+        """
+        window: Optional[ChatWindow] = None
+        try:
+            index = self._backend.locate_row(wanted)
+            if index is None:
+                return None
+            if not self._backend.open_row(index):
+                return None
+            window = self._await_window(wanted)
+        finally:
+            self._backend.clear_row_filter()
+        if window is None:
+            return None
+        self._backend.minimize_window(window.handle)
+        return window
+
+    def _await_window(self, wanted: set[str]) -> Optional[ChatWindow]:
+        """Watch for the window rather than sleeping a flat guess.
+
+        What is left after this is KakaoTalk drawing its own window, and
+        nothing on this side preempts that.
+        """
+        deadline = self._now() + _OPEN_TIMEOUT_SECONDS
+        while self._now() < deadline:
+            window = self._matching_window(wanted)
+            if window is not None:
+                return window
+            self._sleep(_OPEN_POLL_SECONDS)
+        return None
+
+
+class Sender:
+    """Resolve a room's chat window and hand a message to its input."""
+
+    def __init__(
+        self,
+        backend: WindowBackend,
+        running: Callable[[], bool],
+        opener: Optional[RoomOpener] = None,
+        *,
+        recoverer: Optional[Callable[[set[str]], list[ChatWindow]]] = None,
+    ) -> None:
+        self._backend = backend
+        self._running = running
+        self._opener = opener
+        self._recoverer = recoverer
+
+    def resolve(
+        self,
+        room: str,
+        open_if_needed: bool = False,
+        aliases: Iterable[str] = (),
+        hint: Optional[int] = None,
+    ) -> ChatWindow:
+        """Find the one open chat window for *room*, refusing to guess.
+
+        The caller resolves catalog substrings first. A longer window title
+        must never substitute for an unopened, already-resolved room.
+        """
+        if not room.strip():
+            raise KamadoError(ErrorCode.INVALID_REQUEST, "a nonempty room name is required")
+        if not self._running():
+            raise KamadoError(
+                ErrorCode.KAKAO_NOT_RUNNING,
+                "KakaoTalk is not running; start it and open the conversation first",
+            )
+        wanted = {name.strip().casefold() for name in (room, *aliases) if name.strip()}
+        windows = self._backend.chat_windows(hit_test=False)
+        matches = [window for window in windows if window.title.casefold() in wanted]
+
+        if not matches:
+            # A window can be missing from both AX lists while its controls
+            # stay addressable; only then is every window centre hit-tested.
+            windows = self._backend.chat_windows()
+            matches = [window for window in windows if window.title.casefold() in wanted]
+
+        if not matches and self._recoverer is not None:
+            recovered = self._recoverer(wanted)
+            matches = [window for window in recovered if window.title.casefold() in wanted]
+
+        if not matches:
+            if open_if_needed and self._opener is not None:
+                return self._opener.open(room, aliases, hint)
+            raise KamadoError(
+                ErrorCode.WINDOW_NOT_FOUND,
+                f"No open chat window matches {room!r}; open that conversation in "
+                "KakaoTalk (double-click it so it pops out) and try again. "
+                "If already open, the client did not expose it through background "
+                "discovery; no window was raised or Space changed",
+            )
+        if len(matches) > 1:
+            raise KamadoError(
+                ErrorCode.AMBIGUOUS_CHAT,
+                f"{len(matches)} open chat windows match {room!r}; use a more specific name",
+                candidates=[window.title for window in matches],
+            )
+        return matches[0]
+
+    def send(
+        self,
+        room: str,
+        text: str,
+        dry_run: bool = False,
+        open_if_needed: bool = False,
+        aliases: Iterable[str] = (),
+        hint: Optional[int] = None,
+    ) -> SendResult:
+        """Write *text* into *room*'s window and send it, or preview when dry.
+
+        The message is validated and the window resolved before anything is
+        written. Queue acceptance is not proof of network delivery.
+        """
+        if not text or not text.strip():
+            raise KamadoError(ErrorCode.INVALID_REQUEST, "refusing to send an empty message")
+        if "\x00" in text:
+            raise KamadoError(ErrorCode.INVALID_REQUEST, "message contains a null character")
+
+        window = self.resolve(
+            room, open_if_needed=open_if_needed, aliases=aliases, hint=hint
+        )
+        control = self._backend.input_handle(window.handle)
+        if control is None:
+            raise KamadoError(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"found the window for {window.title!r} but not its message box; "
+                "the client version may differ",
+                room=window.title,
+            )
+
+        # An unfinished draft is cleared rather than refused. Whoever is
+        # sending has already named the room and the words, and a refusal that
+        # can only be resolved by walking to the client is worse than losing a
+        # line nobody finished. It is reported rather than done quietly.
+        existing = bool(self._backend.get_text(control))
+
+        if dry_run:
+            return {
+                "submitted": False,
+                "dryRun": True,
+                "room": window.title,
+                "length": len(text),
+                "wouldClearDraft": existing,
+            }
+
+        try:
+            self._backend.set_text(control, text)
+            self._backend.submit(control)
+        except (OSError, ax.AccessibilityDenied) as error:
+            raise KamadoError(
+                ErrorCode.SEND_FAILED, f"could not send to {window.title!r}: {error}",
+                room=window.title,
+            ) from error
+        return {
+            "submitted": True,
+            "dryRun": False,
+            "room": window.title,
+            "length": len(text),
+            "clearedDraft": existing,
+        }
+
+
+# -- the accessibility backend -----------------------------------------------
+
+
+class AXBackend:
+    """A :class:`WindowBackend` and :class:`RoomListBackend` over the AX tree.
+
+    Elements cannot be integers, and the protocols above speak in integer
+    handles because that is what a window was on the platform this was ported
+    from.  Rather than change the contract, each element this backend hands out
+    is registered and referred to by its number, which also keeps a handle from
+    outliving the scan that produced it in any surprising way.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+        self._app = ax.application(pid)
+        self._registry: dict[int, ax.Element] = {}
+        self._windows_by_control: dict[int, ax.Element] = {}
+        self._text_by_control: dict[int, str] = {}
+        self._next = 1
+        self._search_restore: Optional[str] = None
+        """What the client's search box held before this process typed in it."""
+
+    def _register(self, element: ax.Element) -> int:
+        handle = self._next
+        self._next += 1
+        self._registry[handle] = element
+        return handle
+
+    def _element(self, handle: int) -> ax.Element:
+        element = self._registry.get(handle)
+        if element is None:
+            raise KamadoError(
+                ErrorCode.WINDOW_NOT_FOUND, "that window is no longer being tracked"
+            )
+        return element
+
+    def _windows(self, hit_test: bool = True) -> list[ax.Element]:
+        """Enumerate without changing visibility, focus or the active Space."""
+        windows = self._app.windows()
+        if not hit_test:
+            return windows
+        # A window restored while the app is hidden can disappear from both
+        # AX lists while its controls remain usable. Hit-testing within the
+        # application recovers its AXWindow without clicking or unhiding it.
+        for x, y in ax.window_centers(self._pid):
+            hit = self._app.element_at_position(x, y)
+            if hit is None:
+                continue
+            window = hit if hit.role == "AXWindow" else hit.attribute("AXWindow")
+            if not isinstance(window, ax.Element) or window.role != "AXWindow":
+                continue
+            if not any(known.same_as(window) for known in windows):
+                windows.append(window)
+        return windows
+
+    def _main_window(self) -> Optional[ax.Element]:
+        for window in self._windows():
+            if window.identifier == MAIN_WINDOW_IDENTIFIER:
+                return window
+        return None
+
+    def chat_windows(self, hit_test: bool = True) -> list[ChatWindow]:
+        """Return every window that is not the main one, which is a room."""
+        found: list[ChatWindow] = []
+        windows = self._windows(hit_test=hit_test)
+        for window in windows:
+            if window.identifier == MAIN_WINDOW_IDENTIFIER:
+                continue
+            title = window.title.strip()
+            if not title:
+                continue
+            found.append(ChatWindow(handle=self._register(window), title=title))
+        return found
+
+    def recover_windows(self, wanted: set[str]) -> list[ChatWindow]:
+        """Recover exact off-Space windows without activating the application.
+
+        Cocoa keeps one Window-menu item per window even when Accessibility
+        omits that window from every ordinary list. Pressing its
+        ``makeKeyAndOrderFront:`` item does not make KakaoTalk the frontmost
+        application, but it does publish the target through ``AXFocusedWindow``
+        and ``AXMainWindow``. Those direct references are the useful result:
+        re-reading ``AXWindows`` still omits the off-Space window.
+        """
+        menubar = self._app.attribute("AXMenuBar")
+        if not isinstance(menubar, ax.Element):
+            return []
+        recovered: list[ax.Element] = []
+        for bar_item in menubar.children():
+            if bar_item.title not in ("창", "Window"):
+                continue
+            menus = bar_item.children()
+            if not menus:
+                continue
+            for item in menus[0].children():
+                if (
+                    item.identifier != "makeKeyAndOrderFront:"
+                    or item.title.strip().casefold() not in wanted
+                ):
+                    continue
+                item.perform("AXPress")
+                for attribute in ("AXFocusedWindow", "AXMainWindow"):
+                    window = self._app.attribute(attribute)
+                    if (
+                        not isinstance(window, ax.Element)
+                        or window.role != "AXWindow"
+                        or window.title.strip().casefold() not in wanted
+                        or any(known.same_as(window) for known in recovered)
+                    ):
+                        continue
+                    recovered.append(window)
+        return [
+            ChatWindow(handle=self._register(window), title=window.title.strip())
+            for window in recovered
+        ]
+
+    def input_handle(self, window: int) -> Optional[int]:
+        """Find the message box: the text area that is not the transcript.
+
+        A chat window holds two scrolling regions, and the one showing the
+        conversation contains a table of messages while the composer does not.
+        Both levels are read as direct children rather than crawled, because
+        every node is a separate IPC round trip into the client and the
+        transcript below holds hundreds of them.
+        """
+        element = self._element(window)
+        composer: Optional[ax.Element] = None
+        for child in element.children():
+            if child.role != "AXScrollArea":
+                continue
+            subs = child.children()
+            found = [c for c in subs if c.role in _INPUT_ROLES]
+            if found and not any(c.role == "AXTable" for c in subs):
+                composer = found[0]
+        if composer is None:
+            return None
+        handle = self._register(composer)
+        self._windows_by_control[handle] = element
+        return handle
+
+    def get_text(self, control: int) -> str:
+        value = self._element(control).value
+        text = value if isinstance(value, str) else ""
+        return "" if text.strip() in _EMPTY_HINTS else text
+
+    def set_text(self, control: int, text: str) -> None:
+        """Replace the composer's contents with *text*, and prove it landed.
+
+        One ``AXValue`` write, and nothing else.  The write needs no keyboard,
+        no focus and — this is the part worth keeping — **no activation**: the
+        client is never brought forward, the pointer is never moved, and
+        whatever the user is doing is not interrupted.  It also enables the
+        client's own send button, when exposed. :meth:`submit` uses a guarded
+        Return on clients without one, which does require activation and focus.
+
+        Typing the text was tried and abandoned: synthesised keystrokes drop
+        characters unpredictably, and they only arrive at all once the app has
+        been activated and the field clicked, which is the whole cost this
+        avoids.  The value is read back, so a refused write is a failure rather
+        than a silent empty send.
+        """
+        composer = self._element(control)
+        for attempt in range(_WRITE_ATTEMPTS):
+            if composer.set_attribute("AXValue", text) and composer.value == text:
+                self._text_by_control[control] = text
+                return
+            if attempt + 1 < _WRITE_ATTEMPTS:
+                time.sleep(_SETTLE_SECONDS)
+        raise OSError("KakaoTalk refused to accept the message text into the composer")
+
+    def _send_button(self, control: int) -> Optional[ax.Element]:
+        """Return the chat window's send button.
+
+        It is a **direct child** of the chat window, so it is found by reading
+        that one list rather than by walking the subtree: the transcript below
+        holds a button per message, and crawling to find this one measured
+        3.5 s against 0.002 s for the direct children.
+        """
+        window = self._windows_by_control.get(control)
+        if window is None:
+            return None
+        for element in window.children():
+            if element.role == "AXButton" and element.title.strip() in _SEND_BUTTON_TITLES:
+                return element
+        return None
+
+    def submit(self, control: int) -> None:
+        """Commit the message that :meth:`set_text` placed.
+
+        Pressing the send button is what delivers it, and — like the write —
+        it needs no keyboard focus, no pointer and no activation, so the whole
+        send leaves the desktop untouched.  Success is judged by the composer
+        going empty rather than by the press call's own return value, which
+        this client reports as failure even on a press that works.
+
+        With no button, raise the target and activate the client, then focus
+        the composer. Return is posted only after its native identity, owning
+        window and original placed value are confirmed through the app's
+        focused element. This path takes foreground and keyboard focus.
+
+        The button is enabled by the write, but not instantly, so it is waited
+        for rather than pressed on faith — pressing a disabled button does
+        nothing and leaves the message sitting in the box.  Both waits poll,
+        so a fast client costs one read rather than a fixed sleep.
+        """
+        composer = self._element(control)
+        button = self._send_button(control)
+        if button is None:
+            window = self._windows_by_control.get(control)
+            text = self._text_by_control.get(control)
+            if window is None or text is None:
+                raise OSError("cannot target Return without a chat window and placed text")
+            window.perform("AXRaise")
+            window.set_attribute("AXMain", True)
+            activate()
+            composer.set_attribute("AXFocused", True)
+
+            def focused_composer() -> bool:
+                focused = self._app.attribute("AXFocusedUIElement")
+                if not isinstance(focused, ax.Element) or not focused.same_as(composer):
+                    return False
+                focused_window = focused.attribute("AXWindow")
+                return (
+                    isinstance(focused_window, ax.Element)
+                    and focused_window.same_as(window)
+                    and focused.value == text
+                )
+
+            if not self._wait(focused_composer):
+                raise OSError(
+                    "could not verify the target composer's focus, window and text; "
+                    "Return was not posted"
+                )
+            ax.post_key(self._pid, 36)
+        else:
+            if not self._wait(lambda: button.attribute("AXEnabled") is True):
+                raise OSError("the send button did not become enabled; it was not pressed")
+            button.perform("AXPress")
+
+        def emptied() -> bool:
+            remaining = composer.value
+            if not isinstance(remaining, str):
+                raise OSError("could not read the composer after submission; outcome unknown")
+            return not remaining.strip() or remaining.strip() in _EMPTY_HINTS
+
+        if not self._wait(emptied):
+            raise OSError("the message stayed in the composer; it was not sent")
+
+    @staticmethod
+    def _wait(ready, timeout: float = _WAIT_SECONDS) -> bool:
+        """Poll *ready* until it holds, so a quick client is not made to wait."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if ready():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_POLL_SECONDS)
+
+    # -- room list ----------------------------------------------------------
+
+    def _room_table(self) -> Optional[ax.Element]:
+        """The room list, found without walking into every row of it.
+
+        ``descendants`` over the main window visited 1,962 elements and took
+        15.8 s on a list of 264 rooms, nearly all of them the cells inside
+        each row — and a send walked it more than once, which is how opening
+        one room took 75 s while the screen said "보내는 중". A table's own
+        children are rows, so nothing below a table is looked at.
+        """
+        main = self._main_window()
+        if main is None:
+            return None
+        tables: list[ax.Element] = []
+        frontier: list[tuple[ax.Element, int]] = [(main, 0)]
+        while frontier:
+            element, level = frontier.pop(0)
+            if level >= 12:
+                continue
+            for child in element.children():
+                if child.role == "AXTable":
+                    tables.append(child)
+                elif child.role not in ("AXRow", "AXCell"):
+                    frontier.append((child, level + 1))
+        if not tables:
+            return None
+        return max(tables, key=lambda table: len(table.children()))
+
+    def _room_rows(self) -> list[ax.Element]:
+        table = self._room_table()
+        if table is None:
+            return []
+        return [row for row in table.children() if row.role == "AXRow"]
+
+    @staticmethod
+    def _visible(row: ax.Element, area: ax.Element) -> bool:
+        frame, view = row.frame(), area.frame()
+        if frame is None or view is None:
+            return False
+        middle = frame[1] + frame[3] / 2
+        return view[1] <= middle <= view[1] + view[3]
+
+    def _reveal(self, row: ax.Element, table: ax.Element) -> bool:
+        """Scroll the list until *row* is on screen, through its scroll bar.
+
+        The list reports every row, drawn or not, and a row further down sits
+        at its place in the whole list: row 46 was at y = 3,571 while the list
+        showed y = 167 to 712. Double-clicking there clicked nothing, the room
+        never opened, and the send failed. The scroll bar takes its position
+        as a number, so this moves the list without the wheel or the pointer.
+        """
+        area = table.attribute("AXParent")
+        if area is None or getattr(area, "role", "") != "AXScrollArea":
+            return False
+        if self._visible(row, area):
+            return True
+        bar = area.attribute("AXVerticalScrollBar")
+        frame, whole, view = row.frame(), table.frame(), area.frame()
+        if bar is None or frame is None or whole is None or view is None:
+            return False
+        travel = whole[3] - view[3]
+        if travel <= 0:
+            return False
+        # Where the row starts within the whole list, centred in the view.
+        offset = (frame[1] - whole[1]) - (view[3] - frame[3]) / 2
+        bar.set_attribute("AXValue", min(1.0, max(0.0, offset / travel)))
+        return self._wait(lambda: self._visible(row, area), 1.5)
+
+    @staticmethod
+    def _row_title(row: ax.Element) -> str:
+        """Read a room's name out of its row.
+
+        A row is a stack of cells whose roles say what each one is: an
+        ``AXButton`` for the profile picture, an ``AXImage`` for a badge, then
+        the room name, the member count, the time, and the last message — all
+        as ``AXStaticText``.  Measured on a live client, the name is the first
+        ``AXStaticText``; the button's description is "프로필" and the badge's
+        is "badge openchat room", so reading the first text of any kind
+        returned the profile button instead of the room.  The name is taken
+        from the first static-text cell, and the trailing count/time/preview
+        cells are left alone.
+        """
+        for element in row.descendants(depth=4):
+            if element.role != "AXStaticText":
+                continue
+            value = element.value
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if element.title and element.title.strip():
+                return element.title.strip()
+        return ""
+
+    def room_rows(self) -> list[str]:
+        return [self._row_title(row) for row in self._room_rows()]
+
+    def first_matching_row(
+        self, wanted: set[str], hint: Optional[int] = None
+    ) -> tuple[Optional[int], int]:
+        """The first row titled any of *wanted*, and how many rows there are.
+
+        A name is one round trip of about 70 ms, so reading every row before
+        choosing cost about 18 s on a list of 264. The rows are read outward
+        from *hint* — where the catalog's recency order puts the room, which
+        the list mostly follows — and the reading stops at the first match.
+        """
+        rows = self._room_rows()
+        total = len(rows)
+        for index in outward(hint, total):
+            if self._row_title(rows[index]).strip().casefold() in wanted:
+                return index, total
+        return None, total
+
+    def _search_field(self) -> Optional[ax.Element]:
+        """The client's own room search box, which is a direct child."""
+        main = self._main_window()
+        if main is None:
+            return None
+        for child in main.children():
+            if child.role == "AXTextField":
+                return child
+        return None
+
+    def locate_row(self, wanted: set[str]) -> Optional[int]:
+        """Find a row for any of *wanted* by searching the client's whole list.
+
+        Writing the name into the search box is one ``AXValue`` write, the
+        same mechanism sending uses, and the client answers by listing far
+        more rooms than it had drawn — 648 against 26, measured here. The wait
+        is for that longer list to appear, and the scan stops at the first
+        match rather than reading every name.
+        """
+        field = self._search_field()
+        if field is None or not wanted:
+            return None
+        if self._search_restore is None:
+            self._search_restore = str(field.attribute("AXValue") or "")
+        drawn = len(self._room_rows())
+        # Every name, not only the first: the self-chat is 나와의 채팅 in the
+        # catalog but listed under the account's own name, and only the
+        # second is something the client's search can find (#82).
+        for attempt, term in enumerate(sorted(wanted)):
+            if not field.set_attribute("AXValue", term):
+                return None
+            rows = self._room_rows()
+            deadline = time.monotonic() + _SEARCH_SECONDS
+            # Paced like every other wait here: each pass is a round trip per
+            # row, so spinning on the list asks the client thousands of times
+            # for an answer it is still computing. The first search waits for
+            # the longer list; a later one for the list to change at all.
+            while time.monotonic() < deadline and (
+                len(rows) <= drawn if attempt == 0 else len(rows) == drawn
+            ):
+                time.sleep(_POLL_SECONDS)
+                rows = self._room_rows()
+            for index, row in enumerate(rows[:_SEARCH_ROW_LIMIT]):
+                if self._row_title(row).strip().casefold() in wanted:
+                    return index
+            drawn = len(rows)
+        return None
+
+    def clear_row_filter(self) -> None:
+        """Put the search box back to whatever it held, if this wrote in it."""
+        if self._search_restore is None:
+            return
+        field = self._search_field()
+        if field is not None:
+            field.set_attribute("AXValue", self._search_restore)
+        self._search_restore = None
+
+    def open_row(self, row: int) -> bool:
+        """Open one row of the chat list with a real double-click.
+
+        This is the one part of sending that has to touch the screen.  The
+        rows ignore ``AXPress``, ``AXSelected`` and a posted Return — selecting
+        one only highlights it — so nothing but a genuine double-click opens a
+        room.  macOS does not infer that from two clicks in a row either; the
+        second has to carry a click state of 2, which :func:`ax.double_click`
+        sets.
+
+        Because it is a click at screen coordinates, the client is brought
+        forward first so the click cannot land in somebody else's window, and
+        the pointer is put back where it was.
+        """
+        table = self._room_table()
+        rows = [] if table is None else [one for one in table.children() if one.role == "AXRow"]
+        if row < 0 or row >= len(rows) or table is None:
+            return False
+        # A row off screen is scrolled into view, and one that will not come
+        # into view is not clicked at all: its coordinates are somewhere
+        # below the list, where a click opens nothing or something else.
+        if not self._reveal(rows[row], table):
+            return False
+        rectangle = rows[row].frame()
+        if rectangle is None:
+            return False
+        activate()
+        pointer = ax.cursor_location()
+        x, y = rectangle[0] + rectangle[2] / 2, rectangle[1] + rectangle[3] / 2
+        ax.double_click(x, y, restore_to=pointer)
+        return True
+
+    def main_state(self) -> str:
+        main = self._main_window()
+        if main is None:
+            return "missing"
+        if main.attribute("AXMinimized") is True:
+            return "minimized"
+        return "visible"
+
+    def show_main_window(self) -> bool:
+        main = self._main_window()
+        if main is None:
+            # A closed window is not there to be addressed at all, so the
+            # client has to draw one — and it does that after answering the
+            # request, not during it. Measured 0.828 s against the live
+            # client, which outlasts activation's own settle: reading once
+            # after that settle finds nothing and calls the client empty.
+            activate()
+            if self._wait(
+                lambda: self._main_window() is not None, _OPEN_TIMEOUT_SECONDS
+            ):
+                main = self._main_window()
+        if main is None:
+            return False
+        return self._set_minimized(main, False)
+
+    def _set_minimized(self, window: ax.Element, minimized: bool) -> bool:
+        """A setter's success does not prove the asynchronous state change."""
+        if window.attribute("AXMinimized") is minimized:
+            return True
+        return window.set_attribute("AXMinimized", minimized) and self._wait(
+            lambda: window.attribute("AXMinimized") is minimized
+        )
+
+    def restore_main_window(self, state: str) -> None:
+        """Put the main window back the way it was found, as far as it can be.
+
+        One that was minimized goes back to minimized. One that was *closed*
+        is parked minimized instead, because closing it again is not a way
+        back: the client quits a while after its main window goes away, with
+        chat windows still open or not, and tidying the desktop is no reason
+        to shut down somebody's messenger. Minimized is what the room this
+        opened already gets, and it leaves the screen just as clear.
+        """
+        main = self._main_window()
+        if main is None:
+            return
+        if state in ("minimized", "missing") and not self._set_minimized(main, True):
+            raise OSError("could not put the main window back")
+
+    def minimize_window(self, handle: int) -> None:
+        if not self._set_minimized(self._element(handle), True):
+            raise OSError("could not minimize the newly opened chat window")
+
+    def close_window(self, handle: int) -> None:
+        window = self._element(handle)
+        for child in window.descendants(depth=3):
+            if child.subrole == "AXCloseButton":
+                child.perform("AXPress")
+                return
+
+
+def make_sender() -> Sender:
+    """Build the sender this machine can actually use, or explain what is missing."""
+    if not ax.is_trusted():
+        raise KamadoError(
+            ErrorCode.PERMISSION_REQUIRED,
+            "macOS has not granted this terminal permission to control other "
+            "applications. Add it under System Settings › Privacy & Security › "
+            "Accessibility, then run the command again.",
+            permission="accessibility",
+        )
+    pid = client_pid()
+    if pid is None:
+        raise KamadoError(
+            ErrorCode.KAKAO_NOT_RUNNING,
+            "KakaoTalk is not running; start it and sign in first",
+        )
+    backend = AXBackend(pid)
+    return Sender(
+        backend,
+        running,
+        RoomOpener(backend),
+        recoverer=backend.recover_windows,
+    )
+
+
+def send_to_room(
+    reader, target, text: str, *, dry_run: bool = False, open_room: bool = False
+) -> dict:
+    """Resolve the catalog before targeting an exact client window.
+
+    Shared by ``kamado send`` and the daemon, so the duplicate-title refusal
+    and the aliases cannot drift apart between the two.
+    """
+    from .context import _resolve
+
+    if isinstance(target, str) and not target.strip():
+        raise KamadoError(ErrorCode.INVALID_REQUEST, "a nonempty room name is required")
+    room = _resolve(reader, target)
+    catalogued = reader.rooms()
+    # A window title cannot distinguish two catalog rooms with the same name,
+    # even if the caller supplied an id and only one window is currently open.
+    duplicates = [r for r in catalogued if r.title.casefold() == room.title.casefold()]
+    if len(duplicates) != 1:
+        raise KamadoError(
+            ErrorCode.AMBIGUOUS_CHAT,
+            "multiple catalog rooms share this window title; give the target a unique title",
+            candidates=[r.as_json() for r in duplicates],
+        )
+    # The window carries the catalog's own title, which differs from the one
+    # resolved here for the self-chat and for groups with no custom name.
+    stored = reader.stored_title(room.id)
+    aliases = [stored] if stored and stored != room.title else []
+    # The client lists rooms by recency too, so this is close before it is
+    # right - close enough that opening one usually costs a single click.
+    hint = next((index for index, r in enumerate(catalogued) if r.id == room.id), None)
+    try:
+        result = make_sender().send(
+            room.title,
+            text,
+            dry_run=dry_run,
+            open_if_needed=open_room,
+            aliases=aliases,
+            hint=hint,
+        )
+    except OSError as error:
+        raise KamadoError(ErrorCode.SEND_FAILED, str(error)) from error
+    return {**result, "roomId": str(room.id)}

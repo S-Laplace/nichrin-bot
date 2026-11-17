@@ -1,6 +1,15 @@
 MIT License
 
 Copyright (c) 2026 empathyVillain
+Copyright (c) 2026 nichirin-project contributors.
+Copyright (c) 2026 Silver Flight Group, LLC.
+Copyright (c) 2026 kanao-cli contributors.
+Copyright (c) 2026 kamado-cli contributors.
+
+This repository includes code based on https://github.com/sanguneo/nichirin.
+Original copyright, provenance, and license notices remain in
+windows/LICENSE and macos/LICENSE, including attribution to the earlier
+kakaocli work (https://github.com/silver-flight-group/kakaocli).
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>예약 발송 관리 | Nichirin</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="workbench">
+    <aside class="sidebar" aria-label="로컬 관리 안내">
+      <div class="brand">
+        <span class="brand-symbol" aria-hidden="true">N</span>
+        <div><strong>Nichirin</strong><span>메시지 운영 도구</span></div>
+      </div>
+      <div class="side-section">
+        <p class="side-label">로컬 접속</p>
+        <h2>내 PC에서 관리</h2>
+        <p class="side-note">이 PC의 127.0.0.1에서만 접속할 수 있습니다. 관리자 토큰은 필요하지 않습니다.</p>
+        <button id="reload" class="connect-button" type="button">목록 새로고침</button>
+        <p id="notice" class="notice" role="status" aria-live="polite"></p>
+      </div>
+      <div class="side-section guide">
+        <p class="side-label">사용 순서</p>
+        <ol>
+          <li>페이지를 열면 예약 정보를 자동으로 불러옵니다.</li>
+          <li>채팅방과 전송 시각을 정합니다.</li>
+          <li>예약 목록에서 상태를 확인합니다.</li>
+        </ol>
+      </div>
+      <div class="sidebar-bottom">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span>로컬 관리 화면 · 127.0.0.1</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="page-header">
+        <div>
+          <p class="kicker">운영 일정표 / 한국 표준시</p>
+          <h1>예약 발송 관리</h1>
+          <p class="page-description">채팅방에 보낼 메시지를 등록하고 발송 기록을 확인합니다.</p>
+        </div>
+        <div class="mode" id="mode" role="status">연결 확인 중</div>
+      </header>
+
+      <div class="top-panels">
+        <section class="panel compose" aria-labelledby="compose-title">
+          <div class="panel-heading">
+            <h2 id="compose-title">새 예약 등록</h2>
+            <span>한국 시간 (KST)</span>
+          </div>
+          <form id="newjob">
+            <div class="form-grid">
+              <div class="form-field full">
+                <label for="room">발송 채팅방</label>
+                <select id="room" required><option value="">접속 후 채팅방 선택</option></select>
+              </div>
+              <div class="form-field">
+                <label for="at">첫 발송 일시</label>
+                <input id="at" type="datetime-local" required>
+              </div>
+              <div class="form-field">
+                <label for="repeat">반복 주기</label>
+                <select id="repeat">
+                  <option value="once">한 번만</option>
+                  <option value="daily">매일</option>
+                  <option value="weekly">매주 (같은 요일)</option>
+                  <option value="monthly">매월 (같은 날짜)</option>
+                </select>
+              </div>
+              <div class="form-field full">
+                <label for="message">메시지 내용</label>
+                <textarea id="message" maxlength="3000" required placeholder="발송할 내용을 입력하세요."></textarea>
+                <small>최대 3,000자</small>
+              </div>
+            </div>
+            <div class="form-actions">
+              <span>등록 시 선택한 채팅방에만 전송됩니다.</span>
+              <button type="submit" class="primary">예약 등록</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="operating-notes" aria-labelledby="rules-title">
+          <div class="notes-head">
+            <h2 id="rules-title">발송 기준</h2>
+            <span>확인 사항</span>
+          </div>
+          <dl>
+            <div><dt>지연된 예약</dt><dd>예정 시각에서 5분이 지나면 발송하지 않습니다.</dd></div>
+            <div><dt>전송 결과 불명</dt><dd>중복 발송을 막기 위해 자동 재시도하지 않습니다.</dd></div>
+            <div><dt>저장 및 실행</dt><dd>예약은 SQLite에 저장됩니다. 실제 전송에는 <code>--live</code> 실행이 필요합니다.</dd></div>
+            <div><dt>카카오톡</dt><dd>PC 로그인과 Nichirin 연결이 필요하며, 채팅방을 열 때 읽음 처리될 수 있습니다.</dd></div>
+          </dl>
+        </section>
+      </div>
+
+      <section class="panel ledger" aria-labelledby="jobs-title">
+        <div class="panel-heading ledger-heading">
+          <div><h2 id="jobs-title">예약 목록</h2><p>채팅방별 예정 메시지와 활성 상태</p></div>
+          <div class="filter-field">
+            <label for="filter">채팅방 선택</label>
+            <select id="filter"><option value="">전체 채팅방</option></select>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">채팅방</th><th scope="col">다음 발송</th><th scope="col">반복</th><th scope="col">메시지</th><th scope="col">상태</th><th scope="col">관리</th></tr></thead>
+            <tbody id="jobs"><tr><td colspan="6" class="empty">예약 정보를 불러오는 중입니다.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel ledger history-panel" aria-labelledby="history-title">
+        <div class="panel-heading"><h2 id="history-title">발송 이력</h2><span>최근 기록</span></div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">예정 시각</th><th scope="col">채팅방</th><th scope="col">처리 상태</th><th scope="col">상세</th></tr></thead>
+            <tbody id="history"><tr><td colspan="4" class="empty">조회된 기록이 없습니다.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
